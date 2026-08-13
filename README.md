@@ -1,5 +1,7 @@
 # Mimic Simple Voice Chat Integration
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 This is a separate Paper plugin that connects the **Mimic** creature plugin to
 **Simple Voice Chat**. It records speech from connected players, rejects silence,
 low background noise, and short impulses, stores the accepted clips, and replays
@@ -93,3 +95,12 @@ quarantined clips can be removed with the admin clear command.
 Voice recording laws and platform rules vary. The default join notice tells
 players what is happening and how to opt out; server owners are responsible for
 providing any additional notice or consent flow their jurisdiction requires.
+
+## License
+
+Copyright © 2026 ManujeroZX.
+
+This addon is licensed under the
+[GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). Simple
+Voice Chat, Mimic, Paper, and other dependencies remain under their respective
+licenses.
