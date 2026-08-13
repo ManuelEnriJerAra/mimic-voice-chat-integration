@@ -30,7 +30,7 @@ UDP port must already be configured and reachable.
 ## Install
 
 1. Run `mvn clean package`.
-2. Put `target/MimicSimpleVoiceChatIntegration-1.0.0.jar` beside `Mimic-1.0.0.jar`
+2. Put `target/MimicSimpleVoiceChatIntegration-1.0.0-beta.1.jar` beside `Mimic-1.0.0.jar`
    and the Simple Voice Chat plugin in the server's `plugins/` directory.
 3. Restart the server. Do not use a plugin hot-loader for voice chat addons.
 4. Use `/mimicvoice status` to verify that the voice API is ready.

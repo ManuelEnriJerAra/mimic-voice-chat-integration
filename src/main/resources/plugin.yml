@@ -1,5 +1,5 @@
 name: MimicSimpleVoiceChatIntegration
-version: 1.0.0
+version: 1.0.0-beta.1
 main: com.manujerozx.mimicvoice.MimicSimpleVoiceChatIntegration
 api-version: '1.21'
 prefix: MimicSimpleVoiceChat
