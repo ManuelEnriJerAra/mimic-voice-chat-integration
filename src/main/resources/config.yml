@@ -1,0 +1,51 @@
+# Mimic Simple Voice Chat Integration
+#
+# Voice is recorded by default. Tell players that recording is enabled and make sure
+# your use complies with the laws and platform rules that apply to your server.
+recording:
+  enabled: true
+  record-whispers: true
+  permission: mimicvoice.record
+  # When enabled, capture is blocked until the join notice has been sent.
+  privacy-notice: true
+
+  # Simple Voice Chat sends 48 kHz mono Opus audio. The server decodes it to run an
+  # adaptive energy gate; clips containing only silence or low background noise are discarded.
+  voice-activity:
+    activation-db: -42.0
+    peak-db: -32.0
+    noise-margin-db: 10.0
+    release-hysteresis-db: 5.0
+    pre-roll-milliseconds: 100
+    # A phrase ends only after this much silence, so natural pauses stay together.
+    hangover-milliseconds: 1200
+    minimum-speech-milliseconds: 500
+    minimum-clip-milliseconds: 900
+    # Reject clips made mostly of intermittent bumps, static, or background noise.
+    minimum-speech-ratio: 0.25
+    maximum-clip-seconds: 30
+    stream-reset-milliseconds: 1500
+
+storage:
+  # WAV clips are stored under plugins/MimicSimpleVoiceChatIntegration/recordings/<player UUID>/.
+  persist-clips: true
+  maximum-clips-per-player: 20
+  retention-hours: 72
+
+playback:
+  enabled: true
+  distance: 32.0
+  volume: 0.90
+  # Old fragments remain on disk but are not selected for playback.
+  minimum-clip-seconds: 1.0
+  minimum-nearby-listeners: 1
+  # Playback is always restricted to the player whose appearance the Mimic copied.
+
+  # Every Mimic independently chooses random clips at random times.
+  first-delay-seconds:
+    minimum: 5
+    maximum: 20
+  repeat-delay-seconds:
+    minimum: 5
+    maximum: 20
+  retry-without-clip-seconds: 10
