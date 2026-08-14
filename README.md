@@ -37,10 +37,15 @@ UDP port must already be configured and reachable.
 3. Restart the server. Do not use a plugin hot-loader for voice chat addons.
 4. Use `/mimicvoice status` to verify that the voice API is ready.
 
-The plugin detects Mimics through the stable `mimic:mimic` persistent-data marker
-and reads `mimic:mimicked_player` to select clips from the same player as the
-active LibsDisguises appearance. The carrier has no Bukkit custom name, preventing
-a mob-style proximity tag; LibsDisguises renders the normal player nametag.
+The plugin detects Mimics through the stable `mimic:mimic` persistent-data marker.
+The preferred identity contract is `mimic:mimicked_player_uuid`; when present and
+valid, that UUID is authoritative. The legacy `mimic:mimicked_player` name remains
+supported for existing Mimic 1.0.0 entities and is resolved against an exact online
+player first, then the persisted clip name index. Existing Mimics and recordings do
+not need to be deleted. The UUID marker must be written by compatible Mimic-side
+code; this addon does not claim that Mimic 1.0.0 produces it. The carrier has no
+Bukkit custom name, preventing a mob-style proximity tag; LibsDisguises renders the
+normal player nametag.
 
 ## Speech-only recording
 

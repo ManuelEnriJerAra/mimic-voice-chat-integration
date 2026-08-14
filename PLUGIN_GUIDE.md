@@ -413,27 +413,42 @@ persistent data container contains the byte key:
 mimic:mimic
 ```
 
-The entity's represented player is resolved from the string key:
+The preferred identity marker is the string key:
+
+```text
+mimic:mimicked_player_uuid
+```
+
+When present, the marker must be a canonical UUID. It is authoritative and is
+used directly; the legacy name is retained as display/compatibility metadata and
+cannot override it. A malformed UUID marker is handled safely, logged once per
+marker state, and left unresolved rather than risking playback for the wrong
+player.
+
+For old entities, the legacy string key remains supported:
 
 ```text
 mimic:mimicked_player
 ```
 
-If that key is missing or blank, the manager falls back to the entity's Bukkit
-custom name after converting it to plain text. The name is resolved in this
-order:
+If the UUID marker is absent, the legacy name (or the existing Bukkit custom-name
+fallback when the key is absent) is resolved in this order:
 
 1. An exact online player name, yielding the current UUID.
 2. The name index loaded from saved clips, for offline playback.
 
-The clip selector receives the resulting UUID. It never falls back to another
-player's pool. If the represented player cannot be resolved, the Mimic waits and
-tries again later.
+The clip selector receives only the resulting UUID. It never falls back to another
+player's pool. If neither marker nor legacy name can be resolved, the Mimic waits
+and tries again later. This keeps old Mimic 1.0.0 entities and their recordings
+compatible without requiring deletion or recreation. A future Mimic-side change
+may populate the UUID marker; this addon does not claim that the current Mimic
+release writes it.
 
 The state is attached to the entity UUID, so each Mimic has independent timing,
 last-clip tracking, loading state, and active playback. If its represented
-player changes, any current audio is stopped and a new first-delay schedule is
-created.
+player changes—including a UUID marker, legacy name, or resolved UUID change—any
+current audio is stopped, in-flight loads are invalidated, and a new first-delay
+schedule is created.
 
 ## 10. Playback state machine
 
@@ -477,7 +492,9 @@ but excluded by `ClipStore.select()`; the default is one second.
 
 If playback is disabled, the voice API disappears, the entity is removed, or
 configuration is reloaded, active audio is stopped and in-flight loads are
-invalidated through an identity version counter.
+invalidated through an identity version counter. A clip read started for one
+identity is checked again on the Bukkit thread before it can start, so it cannot
+play after the entity changes to another identity.
 
 ## 11. Commands and permissions
 
@@ -592,7 +609,7 @@ is closed afterward and gets its own ten-second completion window.
 
 ## 14. Automated tests
 
-The current test suite contains 28 passing tests:
+The current test suite contains 40 passing tests:
 
 - `WavIOTest` verifies 48 kHz mono PCM write/read round-tripping and temporary
   file cleanup after a successful write.
@@ -608,6 +625,12 @@ The current test suite contains 28 passing tests:
   file cleanup, and explicit persistence-failure reporting.
 - `MimicVoicechatAddonTest` verifies shutdown makes the addon inert and removes
   its registered volume category.
+- `MimicIdentityResolverTest` verifies UUID precedence, exact online-name and
+  persisted-name compatibility, malformed-marker handling, custom-name
+  compatibility, and the absence of cross-player fallback.
+- `MimicIdentityTrackerTest` verifies in-flight load invalidation, active
+  playback stop callbacks, reset of last-clip state, and preservation of
+  scheduling for an unchanged identity.
 - `VoiceRecordingManagerTest` verifies callback offload, per-player FIFO order,
   single-decoder serialization, bounded overflow recovery, consent-denial and
   finish/quit barriers, reload invalidation, normal accepted capture, idempotent
@@ -648,11 +671,14 @@ These details are important when diagnosing behavior or extending the plugin:
    automatically quarantined at that point. Startup validation handles normal
    persisted noise quarantine, but a file that becomes unreadable afterward may
    generate repeated warnings.
-6. **Mimic association is name-based at the integration boundary.** The manager
-   expects Mimic's persistent data value to contain a player name and falls back
-   to a custom name. A renamed player can still resolve through old saved clip
-   names, but a Mimic whose stored name no longer matches any online player or
-   indexed clip cannot play audio.
+6. **Mimic identity is UUID-first with a legacy boundary.** The manager prefers
+   `mimic:mimicked_player_uuid` and uses it as the authoritative clip owner. If
+   that marker is absent, it preserves the old `mimic:mimicked_player` exact
+   online-name and persisted-name-index lookup, plus the existing custom-name
+   fallback. A malformed UUID marker is intentionally unresolved instead of
+   falling back to a potentially wrong name. Old Mimic entities and recordings
+   remain usable; the current addon does not claim that Mimic itself writes the
+   UUID marker.
 7. **The playback scanner currently targets Vindicators.** Mimic must expose its
    carrier as a `Vindicator` with the `mimic:mimic` marker for this integration to
    discover it.
