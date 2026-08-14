@@ -50,7 +50,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
     private final AtomicLong processedPackets = new AtomicLong();
     private final AtomicLong overloadDroppedPackets = new AtomicLong();
     private final AtomicLong acceptedSegments = new AtomicLong();
-    private final AtomicLong saveFailures = new AtomicLong();
+    private final AtomicLong clipSubmissionFailures = new AtomicLong();
     private final AtomicInteger activeSessionCount = new AtomicInteger();
     private volatile boolean closed;
     private volatile boolean capturePaused;
@@ -236,12 +236,24 @@ public final class VoiceRecordingManager implements AutoCloseable {
         return overloadDroppedPackets.get();
     }
 
-    public long savedClips() {
+    public long acceptedSegments() {
         return acceptedSegments.get();
     }
 
+    /** @deprecated use {@link #acceptedSegments()} for the precise metric name. */
+    @Deprecated
+    public long savedClips() {
+        return acceptedSegments();
+    }
+
+    public long clipSubmissionFailures() {
+        return clipSubmissionFailures.get();
+    }
+
+    /** @deprecated use {@link #clipSubmissionFailures()} for the precise metric name. */
+    @Deprecated
     public long saveFailures() {
-        return saveFailures.get();
+        return clipSubmissionFailures();
     }
 
     public int queueDepth() {
@@ -463,20 +475,19 @@ public final class VoiceRecordingManager implements AutoCloseable {
             return;
         }
         // The generation read is the save's linearization point. Do not hold the
-        // state lock while ClipStore clones PCM and submits asynchronous I/O; that
-        // would make a microphone callback wait behind a large completed phrase.
+        // state lock while ClipStore takes ownership of PCM and submits asynchronous
+        // I/O; that would make a microphone callback wait behind a large phrase.
         if (state.generation != generation
                 && (allowedGeneration < 0 || state.generation != allowedGeneration)) {
             return;
         }
+        acceptedSegments.incrementAndGet();
         try {
-            if (clipSaver.save(state.playerId, playerName, samples)) {
-                acceptedSegments.incrementAndGet();
-            } else {
-                saveFailures.incrementAndGet();
+            if (!clipSaver.save(state.playerId, playerName, samples)) {
+                clipSubmissionFailures.incrementAndGet();
             }
         } catch (RuntimeException exception) {
-            saveFailures.incrementAndGet();
+            clipSubmissionFailures.incrementAndGet();
             logger.log(Level.WARNING, "Could not submit speech clip for " + playerName, exception);
         }
     }

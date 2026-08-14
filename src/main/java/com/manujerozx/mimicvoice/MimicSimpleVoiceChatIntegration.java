@@ -195,10 +195,15 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 + recordingManager.queueCapacity() + "; packets received: "
                 + recordingManager.receivedPackets() + "; processed: " + recordingManager.processedPackets()
                 + "; overload drops: " + recordingManager.overloadDroppedPackets()
-                + "; accepted speech segments: " + recordingManager.savedClips()
-                + "; clip submission failures: " + recordingManager.saveFailures()
-                + "; pending storage saves: " + clipStore.pendingSaveCount()
-                + "; storage failures: " + clipStore.saveFailures() + ".",
+                + "; accepted speech segments: " + recordingManager.acceptedSegments()
+                + "; clip submission failures: " + recordingManager.clipSubmissionFailures()
+                + "; pending storage writes: " + clipStore.pendingSaveCount()
+                + " (" + clipStore.pendingSaveBytes() + " bytes)"
+                + "; storage saves succeeded: " + clipStore.saveSucceeded()
+                + "; storage saves failed: " + clipStore.saveFailures()
+                + "; storage saves rejected by backpressure: "
+                + clipStore.saveRejectedBackpressure()
+                + "; memory audio: " + clipStore.memoryAudioBytes() + " bytes.",
                 NamedTextColor.GRAY));
     }
 

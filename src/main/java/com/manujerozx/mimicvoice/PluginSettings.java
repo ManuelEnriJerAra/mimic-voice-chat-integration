@@ -7,6 +7,9 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
     public static final int SAMPLE_RATE = 48_000;
     public static final int FRAME_SIZE = 960;
     public static final int FRAME_MILLISECONDS = 20;
+    public static final long BYTES_PER_MEBIBYTE = 1_048_576L;
+    public static final long DEFAULT_MAXIMUM_PENDING_WRITE_BYTES = 64L * BYTES_PER_MEBIBYTE;
+    public static final long DEFAULT_MAXIMUM_MEMORY_AUDIO_BYTES = 512L * BYTES_PER_MEBIBYTE;
 
     public static PluginSettings from(FileConfiguration config) {
         String configuredPermission = config.getString("recording.permission", "mimicvoice.record");
@@ -31,7 +34,9 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
         Storage storage = new Storage(
                 config.getBoolean("storage.persist-clips", true),
                 clamp(config.getInt("storage.maximum-clips-per-player", 20), 1, 200),
-                clamp(config.getLong("storage.retention-hours", 72L), 1L, 24L * 365L));
+                clamp(config.getLong("storage.retention-hours", 72L), 1L, 24L * 365L),
+                mebibytes(config.getLong("storage.maximum-pending-write-megabytes", 64L), 1L, 4_096L),
+                mebibytes(config.getLong("storage.maximum-memory-audio-megabytes", 512L), 1L, 8_192L));
 
         int firstMinimum = clamp(config.getInt("playback.first-delay-seconds.minimum", 5), 0, 3_600);
         int firstMaximum = Math.max(firstMinimum,
@@ -99,12 +104,22 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
         }
     }
 
-    public record Storage(boolean persistClips, int maximumClipsPerPlayer, long retentionHours) {
+    public record Storage(boolean persistClips, int maximumClipsPerPlayer, long retentionHours,
+                          long maximumPendingWriteBytes, long maximumMemoryAudioBytes) {
+
+        public Storage(boolean persistClips, int maximumClipsPerPlayer, long retentionHours) {
+            this(persistClips, maximumClipsPerPlayer, retentionHours,
+                    DEFAULT_MAXIMUM_PENDING_WRITE_BYTES, DEFAULT_MAXIMUM_MEMORY_AUDIO_BYTES);
+        }
     }
 
     public record Playback(boolean enabled, float distance, double volume, double minimumClipSeconds,
                            int minimumNearbyListeners, int firstMinimumSeconds,
                            int firstMaximumSeconds, int repeatMinimumSeconds,
                            int repeatMaximumSeconds, int retryWithoutClipSeconds) {
+    }
+
+    private static long mebibytes(long value, long minimum, long maximum) {
+        return clamp(value, minimum, maximum) * BYTES_PER_MEBIBYTE;
     }
 }

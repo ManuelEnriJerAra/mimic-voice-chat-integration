@@ -72,6 +72,13 @@ a rolling clip pool: once it is full, saving a new phrase deletes that player's
 oldest phrase. Retention cleanup runs periodically while the server is online.
 With persistence disabled, the bounded pool stays in memory only.
 
+The storage boundary is bounded in both directions: completed clips waiting for
+registration are admitted only while they fit the configured pending-write byte
+budget (64 MiB by default) and the fixed 256-save entry limit. In memory-only
+mode, the per-player pool is additionally subject to the global
+`storage.maximum-memory-audio-megabytes` cap (512 MiB by default); oldest memory
+clips are evicted when that cap is reached.
+
 By default, each Mimic chooses another random clip after a random 5–20 second
 delay measured from the end of its previous clip. Playback uses a locational
 channel that follows the carrier, which remains compatible with LibsDisguises.
@@ -99,9 +106,10 @@ quarantined clips can be removed with the admin clear command.
 
 `/mimicvoice status` also reports the bounded capture queue depth/capacity,
 received and processed packet counts, overload drops, accepted speech segments,
-pending storage saves, and clip/storage submission failures. If recording is
-overloaded, the plugin drops recording work and resets that capture session
-without interrupting normal voice transmission.
+pending storage writes and their PCM byte total, successful/failed storage
+saves, backpressure rejections, and current memory-audio bytes. If recording or
+storage is overloaded, the plugin drops recording work without interrupting
+normal voice transmission; storage admission never blocks the capture worker.
 
 Voice recording laws and platform rules vary. The default join notice tells
 players what is happening and how to opt out; server owners are responsible for

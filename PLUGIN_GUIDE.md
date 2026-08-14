@@ -336,13 +336,19 @@ With `storage.persist-clips: true`, accepted clips are written asynchronously to
 disk and are reloaded on the next startup.
 
 With persistence disabled, clips are stored as `short[]` arrays in memory. The
-same per-player maximum still applies, but all clips disappear on restart.
+same per-player maximum still applies, but all clips disappear on restart. A
+global `storage.maximum-memory-audio-megabytes` limit also bounds the total
+memory-only PCM pool; the oldest memory clips are evicted when it is exceeded.
 
 The storage executor is single-threaded. It serializes file writes, startup
 scanning, reads, deletions, quarantine moves, and five-minute retention passes so
 filesystem operations do not run on the Bukkit main thread. Completed PCM save
-submissions are also bounded to 256 pending PCM arrays; a full save gate rejects the
-new clip without blocking capture and increments the storage-failure metric.
+submissions are bounded by both 256 pending entries and
+`storage.maximum-pending-write-megabytes` (64 MiB by default). Admission is
+non-blocking: a clip that would exceed either bound is rejected and counted as a
+backpressure rejection. The PCM array returned by the segmenter is transferred
+to `ClipStore.saveOwned()` without another full-array clone; the public defensive
+`save()` path still clones caller-owned arrays.
 
 ### Retention and rolling pools
 
@@ -500,7 +506,7 @@ play after the entity changes to another identity.
 
 | Command | Who can use it | Behavior |
 | --- | --- | --- |
-| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending storage saves, and save failures |
+| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending-write count/bytes, successful/failed saves, backpressure rejections, and memory-audio bytes |
 | `/mimicvoice reload` | `mimicvoice.admin` | Reloads `config.yml`, flushes or discards capture sessions depending on the new recording setting, and resets playback states |
 | `/mimicvoice clear <player>` | `mimicvoice.admin` | Removes accepted and quarantined clips for an online name or a name known by the clip index |
 | `/mimicvoice clear all` | `mimicvoice.admin` | Removes all indexed accepted clips and all quarantined WAV files |
@@ -556,6 +562,8 @@ zero frames.
 | `storage.persist-clips` | `true` | Disk-backed WAVs or memory-only clips |
 | `storage.maximum-clips-per-player` | `20` | `1` to `200` clips |
 | `storage.retention-hours` | `72` | `1` hour to 365 days |
+| `storage.maximum-pending-write-megabytes` | `64` | `1` to `4096` MiB of queued PCM |
+| `storage.maximum-memory-audio-megabytes` | `512` | `1` to `8192` MiB of memory-only PCM |
 
 ### Playback
 
@@ -591,7 +599,9 @@ file work:
   100 ms idle/expiry maintenance. It never receives a Bukkit `Player` object.
 - A daemon single-thread storage executor named `mimic-voice-storage` handles
   WAV I/O, clip indexing work, scheduled retention, and deletion. Pending PCM
-  save arrays are capped at 256.
+  save arrays are capped at 256 entries and the configured pending-write byte
+  budget; admission is non-blocking and rejected work is counted separately from
+  actual storage failures.
 - Asynchronous playback reads return to the Bukkit thread before touching entity
   state or starting audio.
 
@@ -609,7 +619,7 @@ is closed afterward and gets its own ten-second completion window.
 
 ## 14. Automated tests
 
-The current test suite contains 40 passing tests:
+The current test suite contains 50 passing tests:
 
 - `WavIOTest` verifies 48 kHz mono PCM write/read round-tripping and temporary
   file cleanup after a successful write.
@@ -619,8 +629,12 @@ The current test suite contains 40 passing tests:
 - `SpeechQualityTest` verifies dense speech passes while sparse spikes fail.
 - `ClipStoreTest` verifies names containing underscores, exact player ownership,
   oldest-clip eviction, quarantine of persisted sparse noise, quarantine
-  retention, offline quarantined-name indexing, and accepted/quarantined clear
-  behavior.
+  retention, offline quarantined-name indexing, accepted/quarantined clear
+  behavior, bounded pending-write accounting, failed-save cleanup, FIFO clear
+  ordering, global memory-only eviction, defensive caller-array ownership, and
+  corrupt playback-file quarantine.
+- `PendingAudioBudgetTest` verifies non-blocking admission against both the
+  pending-entry and pending-byte limits.
 - `ConsentRegistryTest` verifies durable opt-out/opt-in round-trips, temporary
   file cleanup, and explicit persistence-failure reporting.
 - `MimicVoicechatAddonTest` verifies shutdown makes the addon inert and removes
@@ -634,7 +648,8 @@ The current test suite contains 40 passing tests:
 - `VoiceRecordingManagerTest` verifies callback offload, per-player FIFO order,
   single-decoder serialization, bounded overflow recovery, consent-denial and
   finish/quit barriers, reload invalidation, normal accepted capture, idempotent
-  worker shutdown, and a 2,000-packet bounded-queue stress path.
+  worker shutdown, separate speech-acceptance/submission-failure counters, and a
+  2,000-packet bounded-queue stress path.
 
 The tests cover the pure audio, storage, and consent components. They do not run
 an actual Paper server, Simple Voice Chat server, Mimic entity, or networked
@@ -652,11 +667,11 @@ These details are important when diagnosing behavior or extending the plugin:
    does not reproduce the adaptive noise floor and does not separately enforce
    `minimum-clip-milliseconds`. A persisted clip can therefore be judged
    differently after a restart.
-2. **Asynchronous saves create a short visibility window.** The recording counter
-   increments when a completed phrase is submitted to `ClipStore`, while the
-   actual WAV write and index registration happen later on the storage executor.
-   `/mimicvoice status` can briefly show the accepted counter ahead of the loaded
-   clip count.
+2. **Capture and storage counters describe different events.** The accepted
+   speech-segment counter increments when a completed phrase passes capture
+   validation. ClipStore separately reports saves that succeeded, failed, or
+   were rejected by backpressure; pending counts and bytes are released when
+   each asynchronous save reaches a terminal state.
 3. **Capture overload is intentionally lossy for recording only.** The 512-item
    capture queue uses non-blocking admission. An overflow drops the packet,
    invalidates the affected decoder generation, and discards its unfinished
@@ -666,11 +681,11 @@ These details are important when diagnosing behavior or extending the plugin:
    currently speaking, a later completed phrase can be saved after an admin has
    cleared that player's existing pool. Use consent denial or disable recording
    when the unfinished capture must also be discarded.
-5. **Invalid files found during playback reads are retained in the index.** A
-   read failure returns no samples and causes a retry later; the file is not
-   automatically quarantined at that point. Startup validation handles normal
-   persisted noise quarantine, but a file that becomes unreadable afterward may
-   generate repeated warnings.
+5. **Invalid files found during playback reads are removed from active playback.**
+   A read failure returns no samples, removes the clip from the active index, and
+   moves an existing file to the rejected-noise quarantine when possible. This
+   prevents the same corrupt clip from being selected and warned about every
+   playback attempt.
 6. **Mimic identity is UUID-first with a legacy boundary.** The manager prefers
    `mimic:mimicked_player_uuid` and uses it as the authoritative clip owner. If
    that marker is absent, it preserves the old `mimic:mimicked_player` exact

@@ -262,7 +262,23 @@ class VoiceRecordingManagerTest {
             assertEquals(List.of(10, 11, 12), decoder.payloads);
             assertEquals(1, harness.saved.size());
             assertEquals(3 * PluginSettings.FRAME_SIZE, harness.saved.get(0).samples().length);
-            assertEquals(1, harness.manager.savedClips());
+            assertEquals(1, harness.manager.acceptedSegments());
+        }
+    }
+
+    @Test
+    void acceptedSpeechAndStorageSubmissionFailureAreReportedSeparately() throws Exception {
+        FakeDecoder decoder = new FakeDecoder();
+        decoder.output = ignored -> speechFrame(8_000);
+        try (Harness harness = new Harness(8, () -> decoder, false)) {
+            send(harness, 1);
+            send(harness, 2);
+            awaitIdle(harness);
+            harness.manager.finish(harness.playerId);
+            awaitIdle(harness);
+
+            assertEquals(1, harness.manager.acceptedSegments());
+            assertEquals(1, harness.manager.clipSubmissionFailures());
         }
     }
 
@@ -388,6 +404,11 @@ class VoiceRecordingManagerTest {
         private final VoiceRecordingManager manager;
 
         private Harness(int queueCapacity, Supplier<FakeDecoder> decoderSupplier) {
+            this(queueCapacity, decoderSupplier, true);
+        }
+
+        private Harness(int queueCapacity, Supplier<FakeDecoder> decoderSupplier,
+                        boolean acceptClipSubmissions) {
             Logger logger = Logger.getAnonymousLogger();
             logger.setLevel(Level.OFF);
             consent = new ConsentRegistry(Path.of(System.getProperty("java.io.tmpdir"),
@@ -395,7 +416,7 @@ class VoiceRecordingManagerTest {
             manager = new VoiceRecordingManager(logger, () -> settings,
                     (id, name, samples) -> {
                         saved.add(new SavedClip(id, name, samples, Thread.currentThread().getName()));
-                        return true;
+                        return acceptClipSubmissions;
                     },
                     ignored -> {
                         FakeDecoder decoder = decoderSupplier.get();

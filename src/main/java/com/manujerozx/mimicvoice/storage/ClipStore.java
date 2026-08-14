@@ -10,16 +10,17 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -39,11 +40,15 @@ public final class ClipStore implements AutoCloseable {
     private final Logger logger;
     private final Supplier<PluginSettings> settings;
     private final ScheduledExecutorService ioExecutor;
-    private final Semaphore pendingSavePermits = new Semaphore(MAX_PENDING_SAVES);
-    private final AtomicLong rejectedSaveCount = new AtomicLong();
+    private final PendingAudioBudget pendingAudioBudget = new PendingAudioBudget(MAX_PENDING_SAVES);
+    private final Set<PendingSave> pendingSaves = ConcurrentHashMap.newKeySet();
+    private final AtomicLong rejectedBackpressureCount = new AtomicLong();
     private final AtomicLong failedSaveCount = new AtomicLong();
+    private final AtomicLong successfulSaveCount = new AtomicLong();
+    private final AtomicLong lastBackpressureLogAt = new AtomicLong();
     private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
     private final Map<String, UUID> playersByName = new ConcurrentHashMap<>();
+    private volatile boolean closed;
 
     public ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings) {
         this.root = root;
@@ -60,57 +65,52 @@ public final class ClipStore implements AutoCloseable {
         return CompletableFuture.supplyAsync(this::loadPersistedClips, ioExecutor);
     }
 
-    /**
-     * Queues a save without blocking the caller. The PCM save backlog is explicitly
-     * bounded so capture cannot retain an unbounded number of cloned clips in memory.
-     * This public entry point keeps ownership by cloning caller-provided samples.
-     *
-     * @return {@code true} when the save was accepted by the storage queue
-     */
+    /** Queues a save without blocking and defensively owns caller-provided samples. */
     public boolean save(UUID playerId, String playerName, short[] samples) {
         return submitSave(playerId, playerName, samples, false);
     }
 
-    /**
-     * Queues a save while taking ownership of the supplied PCM array. The capture
-     * worker uses this only for a freshly completed segmenter result, which is not
-     * referenced after submission, so the async storage boundary does not need a
-     * second full PCM copy.
-     *
-     * @return {@code true} when the save was accepted by the storage queue
-     */
+    /** Queues a save while taking ownership of a freshly completed segment. */
     public boolean saveOwned(UUID playerId, String playerName, short[] samples) {
         return submitSave(playerId, playerName, samples, true);
     }
 
     private boolean submitSave(UUID playerId, String playerName, short[] samples, boolean owned) {
-        if (samples == null || samples.length == 0) {
+        if (closed || samples == null || samples.length == 0) {
             return false;
         }
-        if (!pendingSavePermits.tryAcquire()) {
-            rejectedSaveCount.incrementAndGet();
-            logger.warning("Voice clip storage save queue is full; dropping a completed clip for "
-                    + safePlayerName(playerName));
+        long bytes = (long) samples.length * Short.BYTES;
+        if (!pendingAudioBudget.tryReserve(bytes, settings.get().storage().maximumPendingWriteBytes())) {
+            rejectForBackpressure(playerName);
             return false;
         }
-        short[] ownedSamples = owned ? samples : samples.clone();
+
+        short[] ownedSamples;
+        PendingSave pending = null;
         try {
-            CompletableFuture.runAsync(() -> {
-                try {
-                    saveNow(playerId, playerName, ownedSamples);
-                } catch (RuntimeException exception) {
-                    failedSaveCount.incrementAndGet();
-                    logger.log(Level.WARNING, "Could not save speech clip for "
-                            + safePlayerName(playerName), exception);
-                } finally {
-                    pendingSavePermits.release();
-                }
-            }, ioExecutor);
+            ownedSamples = owned ? samples : samples.clone();
+            pending = new PendingSave(playerId, playerName, ownedSamples, bytes);
+            pendingSaves.add(pending);
+            ioExecutor.execute(pending);
             return true;
         } catch (RejectedExecutionException exception) {
-            pendingSavePermits.release();
-            rejectedSaveCount.incrementAndGet();
+            if (pending == null) {
+                releaseReservation(bytes);
+            } else {
+                pending.cancel();
+            }
+            rejectForBackpressure(playerName);
             logger.log(Level.WARNING, "Could not queue voice clip storage work", exception);
+            return false;
+        } catch (RuntimeException exception) {
+            if (pending == null) {
+                releaseReservation(bytes);
+            } else {
+                pending.cancel();
+            }
+            failedSaveCount.incrementAndGet();
+            logger.log(Level.WARNING, "Could not prepare voice clip storage work for "
+                    + safePlayerName(playerName), exception);
             return false;
         }
     }
@@ -146,8 +146,8 @@ public final class ClipStore implements AutoCloseable {
                     throw new IOException("Unexpected sample rate " + data.sampleRate());
                 }
                 return data.samples();
-            } catch (IOException exception) {
-                logger.log(Level.WARNING, "Could not read voice clip " + clip.path(), exception);
+            } catch (IOException | RuntimeException exception) {
+                invalidateUnreadableClip(clip, exception);
                 return null;
             }
         }, ioExecutor);
@@ -194,11 +194,41 @@ public final class ClipStore implements AutoCloseable {
     }
 
     public int pendingSaveCount() {
-        return MAX_PENDING_SAVES - pendingSavePermits.availablePermits();
+        return pendingAudioBudget.pendingEntries();
+    }
+
+    public long pendingSaveBytes() {
+        return pendingAudioBudget.pendingBytes();
+    }
+
+    public long saveSucceeded() {
+        return successfulSaveCount.get();
     }
 
     public long saveFailures() {
-        return rejectedSaveCount.get() + failedSaveCount.get();
+        return failedSaveCount.get();
+    }
+
+    public long saveRejectedBackpressure() {
+        return rejectedBackpressureCount.get();
+    }
+
+    public long memoryAudioBytes() {
+        return allClips().stream()
+                .filter(clip -> clip.memoryAudio() != null)
+                .mapToLong(clip -> (long) clip.samples() * Short.BYTES)
+                .sum();
+    }
+
+    /** Test seam: places a FIFO barrier after currently queued storage work. */
+    CompletableFuture<Void> awaitIdle() {
+        CompletableFuture<Void> barrier = new CompletableFuture<>();
+        try {
+            ioExecutor.execute(() -> barrier.complete(null));
+        } catch (RejectedExecutionException exception) {
+            barrier.completeExceptionally(exception);
+        }
+        return barrier;
     }
 
     private int loadPersistedClips() {
@@ -248,6 +278,7 @@ public final class ClipStore implements AutoCloseable {
         int randomSuffix = fileName.lastIndexOf('_');
         int extension = fileName.lastIndexOf('.');
         if (separator <= 0 || randomSuffix <= separator || extension <= randomSuffix) {
+            quarantineInvalidPersistedClip(path, playerId, null);
             return;
         }
         try {
@@ -259,6 +290,7 @@ public final class ClipStore implements AutoCloseable {
             String playerName = fileName.substring(separator + 1, randomSuffix);
             WavIO.WavData data = WavIO.read(path);
             if (data.sampleRate() != PluginSettings.SAMPLE_RATE || data.samples().length <= 0) {
+                quarantineInvalidPersistedClip(path, playerId, null);
                 return;
             }
             if (!SpeechQuality.hasEnoughSpeech(
@@ -269,12 +301,26 @@ public final class ClipStore implements AutoCloseable {
             }
             register(new VoiceClip(fileName, playerId, playerName, path, null,
                     data.samples().length, createdAt));
-        } catch (IOException | NumberFormatException exception) {
-            logger.log(Level.WARNING, "Ignoring invalid saved voice clip " + path, exception);
+        } catch (IOException | RuntimeException exception) {
+            quarantineInvalidPersistedClip(path, playerId, exception);
         }
     }
 
-    private void saveNow(UUID playerId, String playerName, short[] samples) {
+    private void quarantineInvalidPersistedClip(Path path, UUID playerId, Exception failure) {
+        try {
+            if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                quarantine(path, playerId);
+            }
+        } catch (IOException quarantineFailure) {
+            logger.log(Level.WARNING, "Could not quarantine invalid saved voice clip " + path,
+                    quarantineFailure);
+        }
+        if (failure != null) {
+            logger.log(Level.WARNING, "Quarantined invalid saved voice clip " + path, failure);
+        }
+    }
+
+    private boolean saveNow(UUID playerId, String playerName, short[] samples) throws IOException {
         String safeName = safePlayerName(playerName);
         long createdAt = System.currentTimeMillis();
         String id = createdAt + "_" + safeName + "_" + UUID.randomUUID().toString().substring(0, 8);
@@ -282,18 +328,15 @@ public final class ClipStore implements AutoCloseable {
         if (!storage.persistClips()) {
             register(new VoiceClip(id, playerId, safeName, null, samples, samples.length, createdAt));
             enforcePlayerLimit(playerId);
-            return;
+            enforceMemoryLimit();
+            return true;
         }
 
         Path path = root.resolve(playerId.toString()).resolve(id + ".wav");
-        try {
-            WavIO.write(path, samples, PluginSettings.SAMPLE_RATE);
-            register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
-            enforcePlayerLimit(playerId);
-        } catch (IOException exception) {
-            failedSaveCount.incrementAndGet();
-            logger.log(Level.WARNING, "Could not save speech clip for " + safeName, exception);
-        }
+        WavIO.write(path, samples, PluginSettings.SAMPLE_RATE);
+        register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
+        enforcePlayerLimit(playerId);
+        return true;
     }
 
     private void register(VoiceClip clip) {
@@ -321,6 +364,65 @@ public final class ClipStore implements AutoCloseable {
             playerClips.remove(expired);
             deleteFile(expired);
         }
+    }
+
+    private void enforceMemoryLimit() {
+        long maximumBytes = settings.get().storage().maximumMemoryAudioBytes();
+        List<VoiceClip> memoryClips = allClips().stream()
+                .filter(clip -> clip.memoryAudio() != null)
+                .sorted(Comparator.comparingLong(VoiceClip::createdAt))
+                .toList();
+        long totalBytes = memoryClips.stream()
+                .mapToLong(clip -> (long) clip.samples() * Short.BYTES)
+                .sum();
+        for (VoiceClip clip : memoryClips) {
+            if (totalBytes <= maximumBytes) {
+                break;
+            }
+            if (removeActiveClip(clip)) {
+                totalBytes -= (long) clip.samples() * Short.BYTES;
+            }
+        }
+    }
+
+    private void invalidateUnreadableClip(VoiceClip clip, Exception failure) {
+        removeActiveClip(clip);
+        Path path = clip.path();
+        if (path != null && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                quarantine(path, clip.speakerId());
+            } catch (IOException quarantineFailure) {
+                logger.log(Level.WARNING, "Could not quarantine unreadable voice clip " + path,
+                        quarantineFailure);
+            }
+        }
+        logger.log(Level.WARNING, "Removed unreadable voice clip from playback index " + path, failure);
+    }
+
+    private boolean removeActiveClip(VoiceClip clip) {
+        CopyOnWriteArrayList<VoiceClip> playerClips = clips.get(clip.speakerId());
+        if (playerClips == null || !playerClips.remove(clip)) {
+            return false;
+        }
+        if (playerClips.isEmpty()) {
+            clips.remove(clip.speakerId(), playerClips);
+        }
+        return true;
+    }
+
+    private void rejectForBackpressure(String playerName) {
+        rejectedBackpressureCount.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long previous = lastBackpressureLogAt.get();
+        if ((previous == 0L || now - previous >= 10_000L)
+                && lastBackpressureLogAt.compareAndSet(previous, now)) {
+            logger.warning("Voice clip storage backpressure rejected a clip for "
+                    + safePlayerName(playerName));
+        }
+    }
+
+    private void releaseReservation(long bytes) {
+        pendingAudioBudget.release(bytes);
     }
 
     private long retentionCutoff() {
@@ -353,7 +455,7 @@ public final class ClipStore implements AutoCloseable {
             destination = quarantineDirectory.resolve(UUID.randomUUID() + "_" + path.getFileName());
         }
         Files.move(path, destination);
-        logger.info("Quarantined non-speech voice clip " + path.getFileName());
+        logger.info("Quarantined rejected voice clip " + path.getFileName());
     }
 
     private void purgeExpiredQuarantinedFiles(long cutoff) {
@@ -430,6 +532,7 @@ public final class ClipStore implements AutoCloseable {
     private void runRetentionMaintenance() {
         try {
             clips.keySet().forEach(this::enforcePlayerLimit);
+            enforceMemoryLimit();
             purgeExpiredQuarantinedFiles(retentionCutoff());
             removeEmptyDirectories();
         } catch (RuntimeException exception) {
@@ -515,14 +618,60 @@ public final class ClipStore implements AutoCloseable {
         return safe.isBlank() ? "unknown" : safe.substring(0, Math.min(32, safe.length()));
     }
 
+    private final class PendingSave implements Runnable {
+        private final UUID playerId;
+        private final String playerName;
+        private final short[] samples;
+        private final long bytes;
+        private final AtomicBoolean completed = new AtomicBoolean();
+
+        private PendingSave(UUID playerId, String playerName, short[] samples, long bytes) {
+            this.playerId = playerId;
+            this.playerName = playerName;
+            this.samples = samples;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void run() {
+            try {
+                if (saveNow(playerId, playerName, samples)) {
+                    successfulSaveCount.incrementAndGet();
+                }
+            } catch (IOException | RuntimeException exception) {
+                failedSaveCount.incrementAndGet();
+                logger.log(Level.WARNING, "Could not save speech clip for "
+                        + safePlayerName(playerName), exception);
+            } finally {
+                complete();
+            }
+        }
+
+        private void cancel() {
+            complete();
+        }
+
+        private void complete() {
+            if (completed.compareAndSet(false, true)) {
+                pendingSaves.remove(this);
+                releaseReservation(bytes);
+            }
+        }
+    }
+
     @Override
     public void close() {
+        closed = true;
         ioExecutor.shutdown();
         try {
             if (!ioExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
                 logger.warning("Voice clip storage did not finish all pending work before shutdown.");
+                ioExecutor.shutdownNow();
+                pendingSaves.forEach(PendingSave::cancel);
             }
         } catch (InterruptedException exception) {
+            ioExecutor.shutdownNow();
+            pendingSaves.forEach(PendingSave::cancel);
             Thread.currentThread().interrupt();
         }
     }
