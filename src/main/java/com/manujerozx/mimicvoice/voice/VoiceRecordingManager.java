@@ -15,8 +15,6 @@ import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import org.bukkit.entity.Player;
-
 import com.manujerozx.mimicvoice.PluginSettings;
 import com.manujerozx.mimicvoice.audio.VoiceActivitySegmenter;
 import com.manujerozx.mimicvoice.storage.ClipStore;
@@ -39,8 +37,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
     private final DecoderFactory decoderFactory;
     private final ConsentRegistry consentRegistry;
     private final Predicate<UUID> captureAllowed;
+    private final PlayerSnapshotCache playerSnapshots;
     private final Map<UUID, PlayerState> states = new ConcurrentHashMap<>();
-    private final Map<UUID, CaptureSession> sessions = new HashMap<>();
+    private final Map<UUID, CaptureSession> sessions = new ConcurrentHashMap<>();
     private final ArrayBlockingQueue<WorkItem> workQueue;
     private final int queueCapacity;
     private final Thread worker;
@@ -58,14 +57,16 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     public VoiceRecordingManager(Logger logger, Supplier<PluginSettings> settings,
                                  ClipStore clipStore, ConsentRegistry consentRegistry,
-                                 Predicate<UUID> captureAllowed) {
+                                 Predicate<UUID> captureAllowed,
+                                 PlayerSnapshotCache playerSnapshots) {
         this(logger, settings, clipStore::saveOwned, VoicechatApi::createDecoder,
-                consentRegistry, captureAllowed, DEFAULT_CAPTURE_QUEUE_CAPACITY);
+                consentRegistry, captureAllowed, playerSnapshots, DEFAULT_CAPTURE_QUEUE_CAPACITY);
     }
 
     VoiceRecordingManager(Logger logger, Supplier<PluginSettings> settings,
                           ClipSaver clipSaver, DecoderFactory decoderFactory,
                           ConsentRegistry consentRegistry, Predicate<UUID> captureAllowed,
+                          PlayerSnapshotCache playerSnapshots,
                           int queueCapacity) {
         if (queueCapacity < 1) {
             throw new IllegalArgumentException("queueCapacity must be positive");
@@ -76,6 +77,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
         this.decoderFactory = decoderFactory;
         this.consentRegistry = consentRegistry;
         this.captureAllowed = captureAllowed;
+        this.playerSnapshots = playerSnapshots;
         this.queueCapacity = queueCapacity;
         this.workQueue = new ArrayBlockingQueue<>(queueCapacity);
         this.worker = Thread.ofPlatform().name("mimic-voice-capture-worker").daemon(true).unstarted(
@@ -88,9 +90,10 @@ public final class VoiceRecordingManager implements AutoCloseable {
      * The callback runs on Simple Voice Chat's packet-processing thread, so this method
      * must remain bounded and non-blocking.
      */
-    public void onMicrophonePacket(VoicechatApi api, Player player, byte[] opusData, boolean whispering) {
+    public void onMicrophonePacket(VoicechatApi api, UUID playerId,
+                                   byte[] opusData, boolean whispering) {
         try {
-            enqueueMicrophonePacket(api, player, opusData, whispering);
+            enqueueMicrophonePacket(api, playerId, opusData, whispering);
         } catch (RuntimeException exception) {
             // Recording is passive: an admission-side failure must not escape into
             // Simple Voice Chat's packet dispatch path and affect transmission.
@@ -98,18 +101,21 @@ public final class VoiceRecordingManager implements AutoCloseable {
         }
     }
 
-    private void enqueueMicrophonePacket(VoicechatApi api, Player player, byte[] opusData,
+    private void enqueueMicrophonePacket(VoicechatApi api, UUID playerId, byte[] opusData,
                                          boolean whispering) {
         if (closed || capturePaused) {
             return;
         }
-        UUID playerId = player.getUniqueId();
+        PlayerSnapshotCache.Snapshot player = playerSnapshots.get(playerId);
+        if (player == null) {
+            return;
+        }
         PluginSettings.Recording recording = settings.get().recording();
         if (!recording.enabled()
                 || (whispering && !recording.recordWhispers())
                 || !captureAllowed.test(playerId)
                 || !consentRegistry.mayRecord(playerId)
-                || (!recording.permission().isBlank() && !player.hasPermission(recording.permission()))) {
+                || (!recording.permission().isBlank() && !player.hasPermission())) {
             discardExisting(playerId);
             return;
         }
@@ -132,8 +138,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
                     || (whispering && !recording.recordWhispers())
                     || !captureAllowed.test(playerId)
                     || !consentRegistry.mayRecord(playerId)
-                    || (!recording.permission().isBlank()
-                            && !player.hasPermission(recording.permission()))) {
+                    || (!recording.permission().isBlank() && !player.hasPermission())) {
                 requestControlLocked(state, ControlAction.DISCARD);
                 return;
             }
@@ -145,7 +150,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
         byte[] ownedOpusData = opusData.clone();
         receivedPackets.incrementAndGet();
         PacketWork work = new PacketWork(api, playerId, state.stateId, generation,
-                safePlayerName(player.getName()), whispering, ownedOpusData,
+                safePlayerName(player.playerName()), whispering, ownedOpusData,
                 System.currentTimeMillis());
         if (closed || !workQueue.offer(work)) {
             if (!closed) {
@@ -268,6 +273,10 @@ public final class VoiceRecordingManager implements AutoCloseable {
         return worker.isAlive();
     }
 
+    public boolean workerStopped() {
+        return !worker.isAlive();
+    }
+
     /** Test seam: places a FIFO barrier after all currently queued work. */
     boolean awaitIdle(Duration timeout) throws InterruptedException {
         if (closed && !worker.isAlive()) {
@@ -314,6 +323,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
                 }
             }
         } catch (Throwable failure) {
+            clearQueuedWork();
             synchronized (lifecycle) {
                 closed = true;
                 shutdownRequested = true;
@@ -474,21 +484,27 @@ public final class VoiceRecordingManager implements AutoCloseable {
         if (samples == null || samples.length == 0) {
             return;
         }
-        // The generation read is the save's linearization point. Do not hold the
-        // state lock while ClipStore takes ownership of PCM and submits asynchronous
-        // I/O; that would make a microphone callback wait behind a large phrase.
-        if (state.generation != generation
-                && (allowedGeneration < 0 || state.generation != allowedGeneration)) {
-            return;
-        }
-        acceptedSegments.incrementAndGet();
-        try {
-            if (!clipSaver.save(state.playerId, playerName, samples)) {
-                clipSubmissionFailures.incrementAndGet();
+        /*
+         * The generation check and the non-blocking ClipStore admission must be
+         * one linearizable operation. A control request takes this same lock,
+         * so it cannot invalidate the generation between the check and save().
+         * ClipStore.saveOwned only clones/queues bounded work; it does not perform
+         * filesystem I/O here.
+         */
+        synchronized (state.lock) {
+            if (state.generation != generation
+                    && (allowedGeneration < 0 || state.generation != allowedGeneration)) {
+                return;
             }
-        } catch (RuntimeException exception) {
-            clipSubmissionFailures.incrementAndGet();
-            logger.log(Level.WARNING, "Could not submit speech clip for " + playerName, exception);
+            acceptedSegments.incrementAndGet();
+            try {
+                if (!clipSaver.save(state.playerId, playerName, samples)) {
+                    clipSubmissionFailures.incrementAndGet();
+                }
+            } catch (RuntimeException exception) {
+                clipSubmissionFailures.incrementAndGet();
+                logger.log(Level.WARNING, "Could not submit speech clip for " + playerName, exception);
+            }
         }
     }
 
@@ -529,12 +545,34 @@ public final class VoiceRecordingManager implements AutoCloseable {
             Thread.currentThread().interrupt();
         }
         if (worker.isAlive()) {
-            logger.warning("Voice capture worker did not stop within the shutdown timeout; interrupting it.");
+            clearQueuedWork();
+            closeActiveDecoders();
+            logger.warning("Voice capture worker did not stop within the shutdown timeout; clearing queued work, closing decoders, and interrupting it.");
             worker.interrupt();
             try {
                 worker.join(1_000L);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Terminal cancellation fallback for a decoder blocked inside an external
+     * Opus implementation. Normal ownership remains with the capture worker;
+     * this path is used only after the worker missed its shutdown deadline.
+     */
+    private void closeActiveDecoders() {
+        for (CaptureSession session : sessions.values()) {
+            session.requestClose();
+        }
+    }
+
+    private void clearQueuedWork() {
+        WorkItem queued;
+        while ((queued = workQueue.poll()) != null) {
+            if (queued instanceof BarrierWork barrier) {
+                barrier.completed().countDown();
             }
         }
     }
@@ -596,6 +634,8 @@ public final class VoiceRecordingManager implements AutoCloseable {
         private String playerName;
         private long lastPacketAt;
         private boolean idleFlushed;
+        private final java.util.concurrent.atomic.AtomicBoolean decoderClosed =
+                new java.util.concurrent.atomic.AtomicBoolean();
 
         private CaptureSession(PlayerState state, PacketWork firstWork, OpusDecoder decoder,
                                 VoiceActivitySegmenter segmenter) {
@@ -648,7 +688,18 @@ public final class VoiceRecordingManager implements AutoCloseable {
             } else {
                 segmenter.reset();
             }
-            decoder.close();
+            requestClose();
+        }
+
+        private void requestClose() {
+            if (!decoderClosed.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                decoder.close();
+            } catch (RuntimeException exception) {
+                logger.log(Level.WARNING, "Could not close Opus decoder for " + playerId, exception);
+            }
         }
     }
 }

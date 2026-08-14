@@ -189,6 +189,52 @@ class MimicPlaybackControllerTest {
     }
 
     @Test
+    void clearPlayerInvalidatesInFlightReadAndStopsActivePlayback() {
+        try (Harness harness = new Harness(settings(true, 0, 0, 0, 0, 0, 5))) {
+            harness.delays.add(0L);
+            VoiceClip clip = clip("a", PLAYER_A);
+            harness.clips.add(PLAYER_A, clip);
+            MimicPlaybackController.Target target = target(ENTITY_ID, PLAYER_A, "Alice", 1,
+                    MimicIdentityResolver.Source.UUID_MARKER);
+            harness.tick(target);
+            harness.controller.invalidatePlayer(PLAYER_A);
+            harness.completeRead(clip);
+            harness.main.runAll();
+
+            assertTrue(harness.sink.started.isEmpty());
+            assertEquals(0, harness.controller.activePlaybacks());
+
+            harness.delays.add(0L);
+            harness.clock.now = 5_000L;
+            harness.tick(target);
+            harness.completeRead(clip);
+            harness.main.runAll();
+            assertEquals(1, harness.sink.started.size());
+            harness.controller.invalidatePlayer(PLAYER_A);
+            assertEquals(1, harness.sink.stopCount);
+        }
+    }
+
+    @Test
+    void playbackStopFailureDoesNotAbortStateCleanup() {
+        try (Harness harness = new Harness(settings(true, 0, 0, 0, 0, 0, 5))) {
+            harness.delays.add(0L);
+            VoiceClip clip = clip("a", PLAYER_A);
+            harness.clips.add(PLAYER_A, clip);
+            harness.tick(target(ENTITY_ID, PLAYER_A, "Alice", 1,
+                    MimicIdentityResolver.Source.UUID_MARKER));
+            harness.completeRead(clip);
+            harness.main.runAll();
+            harness.sink.throwOnStop = true;
+
+            harness.controller.invalidatePlayer(PLAYER_A);
+
+            assertEquals(0, harness.controller.activePlaybacks());
+            assertEquals(1, harness.sink.stopCount);
+        }
+    }
+
+    @Test
     void reloadInvalidatesLoadsAndStopsActivePlayback() {
         try (Harness harness = new Harness(settings(true, 0, 0, 0, 0, 0, 5))) {
             harness.delays.add(0L);
@@ -504,6 +550,7 @@ class MimicPlaybackControllerTest {
         private final List<String> startThreads = new ArrayList<>();
         private FakePlayback lastPlayback;
         private int stopCount;
+        private boolean throwOnStop;
 
         @Override
         public MimicPlaybackController.PlaybackHandle start(
@@ -549,6 +596,9 @@ class MimicPlaybackControllerTest {
         @Override
         public void stop() {
             sink.stopCount++;
+            if (sink.throwOnStop) {
+                throw new IllegalStateException("simulated voice API stop failure");
+            }
         }
     }
 }

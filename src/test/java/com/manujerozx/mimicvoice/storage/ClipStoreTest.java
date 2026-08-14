@@ -2,6 +2,7 @@ package com.manujerozx.mimicvoice.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -11,7 +12,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import org.junit.jupiter.api.Test;
@@ -242,6 +248,39 @@ class ClipStoreTest {
             assertNotNull(clip);
             assertArrayEquals(new short[] {expectedFirstSample},
                     new short[] {clip.memoryAudio()[0]});
+        }
+    }
+
+    @Test
+    void diskPlaybackReadsHaveASeparateBoundedAdmissionQueue() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        CountDownLatch firstReadEntered = new CountDownLatch(1);
+        CountDownLatch releaseReads = new CountDownLatch(1);
+        ClipStore.WavReader reader = path -> {
+            firstReadEntered.countDown();
+            try {
+                releaseReads.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
+            return new WavIO.WavData(PluginSettings.SAMPLE_RATE, new short[] {1});
+        };
+
+        try (ClipStore store = new ClipStore(temporaryDirectory.resolve("bounded-reads"),
+                Logger.getAnonymousLogger(), () -> settings(20), reader)) {
+            List<CompletableFuture<short[]>> reads = new ArrayList<>();
+            for (int index = 0; index < ClipStore.MAX_PENDING_READS + 8; index++) {
+                reads.add(store.read(new VoiceClip("read-" + index, playerId, "Player",
+                        temporaryDirectory.resolve("read-" + index + ".wav"), null, 1,
+                        System.currentTimeMillis())));
+            }
+
+            assertTrue(firstReadEntered.await(5, TimeUnit.SECONDS));
+            assertTrue(store.pendingReadCount() <= ClipStore.MAX_PENDING_READS);
+            assertTrue(store.readRejectedBackpressure() > 0,
+                    "reads beyond the bounded queue must be rejected for retry");
+            releaseReads.countDown();
+            reads.forEach(read -> assertDoesNotThrow(() -> read.get(5, TimeUnit.SECONDS)));
         }
     }
 

@@ -23,7 +23,6 @@ import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import org.bukkit.entity.Player;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -150,7 +149,7 @@ class VoiceRecordingManagerTest {
             assertTrue(decoder.decodeEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
             send(harness, 2);
 
-            assertTrue(harness.consent.setAllowed(harness.playerId, false));
+            assertTrue(harness.consent.setAllowed(harness.playerId, false).get());
             harness.manager.discard(harness.playerId);
             decoder.releaseGate();
             awaitIdle(harness);
@@ -283,6 +282,49 @@ class VoiceRecordingManagerTest {
     }
 
     @Test
+    void generationCheckAndClipAdmissionAreAtomicAgainstDiscard() throws Exception {
+        FakeDecoder decoder = new FakeDecoder();
+        decoder.output = ignored -> speechFrame(8_000);
+        CountDownLatch saveEntered = new CountDownLatch(1);
+        CountDownLatch releaseSave = new CountDownLatch(1);
+        AtomicInteger saveCount = new AtomicInteger();
+        VoiceRecordingManager.ClipSaver blockingSaver = (id, name, samples) -> {
+            saveCount.incrementAndGet();
+            saveEntered.countDown();
+            try {
+                releaseSave.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            return true;
+        };
+        try (Harness harness = new Harness(8, () -> decoder, blockingSaver)) {
+            send(harness, 1);
+            awaitIdle(harness);
+            harness.manager.finish(harness.playerId);
+            assertTrue(saveEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+            CountDownLatch discardStarted = new CountDownLatch(1);
+            CountDownLatch discardCompleted = new CountDownLatch(1);
+            Thread discard = Thread.ofPlatform().start(() -> {
+                discardStarted.countDown();
+                harness.manager.discard(harness.playerId);
+                discardCompleted.countDown();
+            });
+            assertTrue(discardStarted.await(1, TimeUnit.SECONDS));
+            assertFalse(discardCompleted.await(200, TimeUnit.MILLISECONDS),
+                    "discard must wait for an already-admitted clip save to finish");
+
+            releaseSave.countDown();
+            assertTrue(discardCompleted.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            discard.join(TEST_TIMEOUT.toMillis());
+            awaitIdle(harness);
+            assertEquals(1, saveCount.get());
+        }
+    }
+
+    @Test
     void closeIsIdempotentAndStopsTheCaptureWorker() throws Exception {
         Harness harness = new Harness(4, FakeDecoder::new);
         assertTrue(harness.manager.workerAlive());
@@ -290,6 +332,28 @@ class VoiceRecordingManagerTest {
         harness.manager.close();
         assertFalse(harness.manager.workerAlive());
         assertEquals(0, harness.manager.activeSessions());
+    }
+
+    @Test
+    void fatalWorkerFailureDropsQueuedPacketsBeforeTerminating() throws Exception {
+        FakeDecoder decoder = new FakeDecoder();
+        decoder.gatePayload(1);
+        decoder.output = ignored -> {
+            throw new AssertionError("simulated fatal decoder failure");
+        };
+        try (Harness harness = new Harness(4, () -> decoder)) {
+            send(harness, 1);
+            assertTrue(decoder.decodeEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            send(harness, 2);
+            decoder.releaseGate();
+
+            long deadline = System.nanoTime() + TEST_TIMEOUT.toNanos();
+            while (harness.manager.workerAlive() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertFalse(harness.manager.workerAlive());
+            assertEquals(0, harness.manager.queueDepth());
+        }
     }
 
     @Test
@@ -313,7 +377,7 @@ class VoiceRecordingManagerTest {
     }
 
     private static void send(Harness harness, int payload) {
-        harness.manager.onMicrophonePacket(harness.api, harness.player,
+        harness.manager.onMicrophonePacket(harness.api, harness.playerId,
                 new byte[] {(byte) payload}, false);
     }
 
@@ -339,18 +403,6 @@ class VoiceRecordingManagerTest {
                 new PluginSettings.Storage(false, 20, 72),
                 new PluginSettings.Playback(true, 32.0F, 0.9, 0.01,
                         0, 5, 20, 5, 20, 10));
-    }
-
-    private static Player fakePlayer(UUID playerId) {
-        return (Player) Proxy.newProxyInstance(
-                Player.class.getClassLoader(), new Class<?>[] {Player.class},
-                (proxy, method, arguments) -> switch (method.getName()) {
-                    case "getUniqueId" -> playerId;
-                    case "getName" -> "TestPlayer";
-                    case "hasPermission" -> true;
-                    case "isOnline" -> true;
-                    default -> defaultValue(method.getReturnType());
-                });
     }
 
     private static VoicechatApi fakeApi() {
@@ -395,9 +447,9 @@ class VoiceRecordingManagerTest {
 
     private static final class Harness implements AutoCloseable {
         private final UUID playerId = UUID.randomUUID();
-        private final Player player = fakePlayer(playerId);
         private final VoicechatApi api = fakeApi();
         private final ConsentRegistry consent;
+        private final PlayerSnapshotCache playerSnapshots = new PlayerSnapshotCache();
         private final List<SavedClip> saved = new CopyOnWriteArrayList<>();
         private final List<FakeDecoder> decoders = new CopyOnWriteArrayList<>();
         private volatile PluginSettings settings = testSettings();
@@ -413,6 +465,7 @@ class VoiceRecordingManagerTest {
             logger.setLevel(Level.OFF);
             consent = new ConsentRegistry(Path.of(System.getProperty("java.io.tmpdir"),
                     "mimic-voice-test-" + UUID.randomUUID()).toFile(), logger);
+            playerSnapshots.put(playerId, "TestPlayer", true);
             manager = new VoiceRecordingManager(logger, () -> settings,
                     (id, name, samples) -> {
                         saved.add(new SavedClip(id, name, samples, Thread.currentThread().getName()));
@@ -422,7 +475,22 @@ class VoiceRecordingManagerTest {
                         FakeDecoder decoder = decoderSupplier.get();
                         decoders.add(decoder);
                         return decoder.asDecoder();
-                    }, consent, ignored -> true, queueCapacity);
+                    }, consent, ignored -> true, playerSnapshots, queueCapacity);
+        }
+
+        private Harness(int queueCapacity, Supplier<FakeDecoder> decoderSupplier,
+                        VoiceRecordingManager.ClipSaver clipSaver) {
+            Logger logger = Logger.getAnonymousLogger();
+            logger.setLevel(Level.OFF);
+            consent = new ConsentRegistry(Path.of(System.getProperty("java.io.tmpdir"),
+                    "mimic-voice-test-" + UUID.randomUUID()).toFile(), logger);
+            playerSnapshots.put(playerId, "TestPlayer", true);
+            manager = new VoiceRecordingManager(logger, () -> settings, clipSaver,
+                    ignored -> {
+                        FakeDecoder decoder = decoderSupplier.get();
+                        decoders.add(decoder);
+                        return decoder.asDecoder();
+                    }, consent, ignored -> true, playerSnapshots, queueCapacity);
         }
 
         private List<Integer> decodedPayloads() {
@@ -435,6 +503,7 @@ class VoiceRecordingManagerTest {
         public void close() {
             decoders.forEach(FakeDecoder::releaseGate);
             manager.close();
+            consent.close();
         }
     }
 

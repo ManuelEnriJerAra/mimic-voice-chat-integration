@@ -82,7 +82,9 @@ registration are admitted only while they fit the configured pending-write byte
 budget (64 MiB by default) and the fixed 256-save entry limit. In memory-only
 mode, the per-player pool is additionally subject to the global
 `storage.maximum-memory-audio-megabytes` cap (512 MiB by default); oldest memory
-clips are evicted when that cap is reached.
+clips are evicted when that cap is reached. Disk playback reads use a separate
+fixed 64-read queue; excess reads are rejected for a later playback retry rather
+than accumulating in an unbounded executor.
 
 By default, each Mimic chooses another random clip after a random 5–20 second
 delay measured from the end of its previous clip. Playback uses a locational
@@ -112,9 +114,10 @@ quarantined clips can be removed with the admin clear command.
 `/mimicvoice status` also reports the bounded capture queue depth/capacity,
 received and processed packet counts, overload drops, accepted speech segments,
 pending storage writes and their PCM byte total, successful/failed storage
-saves, backpressure rejections, and current memory-audio bytes. If recording or
-storage is overloaded, the plugin drops recording work without interrupting
-normal voice transmission; storage admission never blocks the capture worker.
+saves, save/read backpressure rejections, pending playback reads, and current
+memory-audio bytes. If recording or storage is overloaded, the plugin drops
+recording work without interrupting normal voice transmission; storage admission
+never blocks the capture worker.
 
 Voice recording laws and platform rules vary. The default join notice tells
 players what is happening and how to opt out; server owners are responsible for

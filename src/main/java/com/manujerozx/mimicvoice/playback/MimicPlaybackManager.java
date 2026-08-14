@@ -11,6 +11,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
@@ -74,7 +75,9 @@ public final class MimicPlaybackManager implements AutoCloseable {
                 this::createPlayback,
                 runnable -> Bukkit.getScheduler().runTask(plugin, runnable),
                 System::currentTimeMillis,
-                this::randomDelayMillis);
+                this::randomDelayMillis,
+                exception -> plugin.getLogger().log(Level.WARNING,
+                        "Mimic playback cleanup failed", exception));
     }
 
     public void start() {
@@ -83,6 +86,14 @@ public final class MimicPlaybackManager implements AutoCloseable {
 
     public void reload() {
         controller.reload();
+    }
+
+    public void clearAll() {
+        controller.invalidateAll();
+    }
+
+    public void clearPlayer(UUID playerId) {
+        controller.invalidatePlayer(playerId);
     }
 
     public int trackedMimics() {
@@ -198,19 +209,32 @@ public final class MimicPlaybackManager implements AutoCloseable {
         if (channel == null) {
             return null;
         }
-        channel.setDistance(settings.get().playback().distance());
-        channel.setCategory(MimicVoicechatAddon.VOLUME_CATEGORY);
+        AudioPlayer audioPlayer = null;
+        try {
+            channel.setDistance(settings.get().playback().distance());
+            channel.setCategory(MimicVoicechatAddon.VOLUME_CATEGORY);
 
-        short[] adjusted = MimicPlaybackController.applyGain(samples, gain);
-        AudioPlayer audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), adjusted);
-        if (audioPlayer == null) {
-            return null;
+            short[] adjusted = MimicPlaybackController.applyGain(samples, gain);
+            audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), adjusted);
+            if (audioPlayer == null) {
+                return null;
+            }
+            ActivePlayback handle = new ActivePlayback(api, audioPlayer, channel,
+                    () -> currentMimics.get(target.entityId()), stopped);
+            audioPlayer.setOnStopped(handle::finish);
+            audioPlayer.startPlaying();
+            return handle;
+        } catch (RuntimeException exception) {
+            if (audioPlayer != null) {
+                try {
+                    audioPlayer.stopPlaying();
+                } catch (RuntimeException cleanupFailure) {
+                    plugin.getLogger().log(Level.WARNING,
+                            "Could not stop a partially started Mimic playback", cleanupFailure);
+                }
+            }
+            throw exception;
         }
-        ActivePlayback handle = new ActivePlayback(api, audioPlayer, channel,
-                () -> currentMimics.get(target.entityId()), stopped);
-        audioPlayer.setOnStopped(handle::finish);
-        audioPlayer.startPlaying();
-        return handle;
     }
 
     @Override

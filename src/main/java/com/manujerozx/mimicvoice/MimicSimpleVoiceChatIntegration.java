@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,6 +19,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitTask;
 
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -26,6 +28,7 @@ import com.manujerozx.mimicvoice.playback.MimicPlaybackManager;
 import com.manujerozx.mimicvoice.storage.ClipStore;
 import com.manujerozx.mimicvoice.storage.ConsentRegistry;
 import com.manujerozx.mimicvoice.voice.MimicVoicechatAddon;
+import com.manujerozx.mimicvoice.voice.PlayerSnapshotCache;
 import com.manujerozx.mimicvoice.voice.VoiceRecordingManager;
 
 import de.maxhenkel.voicechat.api.BukkitVoicechatService;
@@ -38,8 +41,11 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
     private VoiceRecordingManager recordingManager;
     private MimicVoicechatAddon voicechatAddon;
     private MimicPlaybackManager playbackManager;
+    private final PlayerSnapshotCache playerSnapshots = new PlayerSnapshotCache();
     private final Set<UUID> privacyNotifiedPlayers = ConcurrentHashMap.newKeySet();
     private volatile boolean capturePaused = true;
+    private volatile boolean consentReady;
+    private BukkitTask playerSnapshotTask;
 
     @Override
     public void onEnable() {
@@ -49,8 +55,10 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
         Path recordingDirectory = getDataFolder().toPath().resolve("recordings");
         clipStore = new ClipStore(recordingDirectory, getLogger(), this::settings);
         recordingManager = new VoiceRecordingManager(
-                getLogger(), this::settings, clipStore, consentRegistry, this::captureAllowed);
+                getLogger(), this::settings, clipStore, consentRegistry, this::captureAllowed,
+                playerSnapshots);
         voicechatAddon = new MimicVoicechatAddon(recordingManager, getLogger());
+        refreshPlayerSnapshots();
 
         BukkitVoicechatService voicechatService = getServer().getServicesManager()
                 .load(BukkitVoicechatService.class);
@@ -65,8 +73,8 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 this, clipStore, this::settings, voicechatAddon::serverApi);
         playbackManager.start();
         getServer().getPluginManager().registerEvents(this, this);
-        Bukkit.getOnlinePlayers().forEach(this::sendPrivacyNotice);
-        capturePaused = false;
+        playerSnapshotTask = Bukkit.getScheduler().runTaskTimer(this, this::refreshPlayerSnapshots,
+                1L, 20L);
         if (getCommand("mimicvoice") != null) {
             getCommand("mimicvoice").setExecutor(this);
             getCommand("mimicvoice").setTabCompleter(this);
@@ -78,11 +86,41 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                         + " saved speech clip(s).");
             }
         });
+        consentRegistry.initialize().whenComplete((loaded, failure) -> {
+            if (!isEnabled()) {
+                return;
+            }
+            try {
+                Bukkit.getScheduler().runTask(this, () -> {
+                    if (!isEnabled()) {
+                        return;
+                    }
+                    if (failure != null || !Boolean.TRUE.equals(loaded)) {
+                        getLogger().severe("Consent data could not be loaded; voice capture remains paused.");
+                        return;
+                    }
+                    consentReady = true;
+                    refreshPlayerSnapshots();
+                    Bukkit.getOnlinePlayers().forEach(this::sendPrivacyNotice);
+                    capturePaused = false;
+                });
+            } catch (RuntimeException exception) {
+                if (isEnabled()) {
+                    getLogger().log(java.util.logging.Level.WARNING,
+                            "Could not dispatch consent initialization to the Bukkit thread", exception);
+                }
+            }
+        });
     }
 
     @Override
     public void onDisable() {
         capturePaused = true;
+        consentReady = false;
+        if (playerSnapshotTask != null) {
+            playerSnapshotTask.cancel();
+            playerSnapshotTask = null;
+        }
         if (voicechatAddon != null) {
             voicechatAddon.close();
         }
@@ -91,23 +129,37 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
         }
         if (recordingManager != null) {
             recordingManager.close();
+            if (!recordingManager.workerStopped()) {
+                getLogger().severe("Voice capture worker did not terminate before storage shutdown; "
+                        + "the installed Opus implementation ignored cancellation.");
+            }
         }
         if (clipStore != null) {
             clipStore.close();
         }
+        if (consentRegistry != null) {
+            consentRegistry.close();
+        }
+        playerSnapshots.replaceAll(Map.of());
         privacyNotifiedPlayers.clear();
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        privacyNotifiedPlayers.remove(event.getPlayer().getUniqueId());
-        recordingManager.endPlayer(event.getPlayer().getUniqueId());
+        UUID playerId = event.getPlayer().getUniqueId();
+        playerSnapshots.remove(playerId);
+        privacyNotifiedPlayers.remove(playerId);
+        recordingManager.endPlayer(playerId);
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        recordingManager.resumePlayer(event.getPlayer().getUniqueId());
-        sendPrivacyNotice(event.getPlayer());
+        Player player = event.getPlayer();
+        refreshPlayerSnapshot(player);
+        recordingManager.resumePlayer(player.getUniqueId());
+        if (!capturePaused) {
+            sendPrivacyNotice(player);
+        }
     }
 
     @Override
@@ -130,11 +182,12 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 reloadConfig();
                 privacyNotifiedPlayers.clear();
                 settings = PluginSettings.from(getConfig());
+                refreshPlayerSnapshots();
                 recordingManager.reload();
                 playbackManager.reload();
                 Bukkit.getOnlinePlayers().forEach(this::sendPrivacyNotice);
             } finally {
-                capturePaused = false;
+                capturePaused = !consentReady;
             }
             sender.sendMessage(Component.text("Mimic voice settings reloaded.", NamedTextColor.GREEN));
             return true;
@@ -158,21 +211,16 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
         }
         String action = args.length >= 2 ? args[1].toLowerCase(Locale.ROOT) : "status";
         if (action.equals("allow") || action.equals("on")) {
-            boolean persisted = consentRegistry.setAllowed(player.getUniqueId(), true);
-            String message = persisted
-                    ? "Your future voice activity may be recorded for Mimics."
-                    : "Recording is allowed for this session, but your preference could not be saved.";
-            sender.sendMessage(Component.text(message,
-                    persisted ? NamedTextColor.GREEN : NamedTextColor.YELLOW));
+            consentRegistry.setAllowed(player.getUniqueId(), true)
+                    .thenAccept(saved -> reportConsentPersistence(player, saved, true));
+            sender.sendMessage(Component.text(
+                    "Your future voice activity may be recorded for Mimics.", NamedTextColor.GREEN));
         } else if (action.equals("deny") || action.equals("off")) {
-            boolean persisted = consentRegistry.setAllowed(player.getUniqueId(), false);
+            consentRegistry.setAllowed(player.getUniqueId(), false)
+                    .thenAccept(saved -> reportConsentPersistence(player, saved, false));
             recordingManager.discard(player.getUniqueId());
-            String message = persisted
-                    ? "Your future voice activity will not be recorded."
-                    : "Recording is disabled for this session, but your opt-out could not be saved; "
-                            + "contact an administrator before reconnecting.";
-            sender.sendMessage(Component.text(message,
-                    persisted ? NamedTextColor.GREEN : NamedTextColor.RED));
+            sender.sendMessage(Component.text(
+                    "Your future voice activity will not be recorded.", NamedTextColor.GREEN));
         } else {
             boolean allowed = consentRegistry.mayRecord(player.getUniqueId());
             sender.sendMessage(Component.text("Mimic voice recording is currently "
@@ -203,12 +251,15 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 + "; storage saves failed: " + clipStore.saveFailures()
                 + "; storage saves rejected by backpressure: "
                 + clipStore.saveRejectedBackpressure()
+                + "; pending playback reads: " + clipStore.pendingReadCount()
+                + "; playback reads rejected by backpressure: " + clipStore.readRejectedBackpressure()
                 + "; memory audio: " + clipStore.memoryAudioBytes() + " bytes.",
                 NamedTextColor.GRAY));
     }
 
     private void clearClips(CommandSender sender, String target) {
         if (target.equalsIgnoreCase("all")) {
+            playbackManager.clearAll();
             clipStore.clearAll().thenAccept(count -> sendAsync(sender,
                     "Removed " + count + " Mimic voice clip(s)."));
             return;
@@ -225,6 +276,7 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
             return;
         }
         UUID resolvedId = playerId;
+        playbackManager.clearPlayer(resolvedId);
         clipStore.clearPlayer(resolvedId).thenAccept(count -> sendAsync(sender,
                 "Removed " + count + " Mimic voice clip(s) for " + target + "."));
     }
@@ -252,8 +304,49 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
         privacyNotifiedPlayers.add(player.getUniqueId());
     }
 
+    private void reportConsentPersistence(Player player, boolean saved, boolean allowed) {
+        if (saved || !isEnabled()) {
+            return;
+        }
+        try {
+            Bukkit.getScheduler().runTask(this, () -> {
+                if (!isEnabled()) {
+                    return;
+                }
+                String message = allowed
+                        ? "Recording is allowed for this session, but your preference could not be saved."
+                        : "Recording is disabled for this session, but your opt-out could not be saved; "
+                                + "contact an administrator before reconnecting.";
+                player.sendMessage(Component.text(message,
+                        allowed ? NamedTextColor.YELLOW : NamedTextColor.RED));
+            });
+        } catch (RuntimeException exception) {
+            if (isEnabled()) {
+                getLogger().log(java.util.logging.Level.WARNING,
+                        "Could not dispatch consent persistence status to the Bukkit thread", exception);
+            }
+        }
+    }
+
+    private void refreshPlayerSnapshots() {
+        Map<UUID, PlayerSnapshotCache.Snapshot> replacement = new java.util.HashMap<>();
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            PluginSettings.Recording recording = settings.recording();
+            replacement.put(player.getUniqueId(), new PlayerSnapshotCache.Snapshot(
+                    player.getName(), recording.permission().isBlank()
+                            || player.hasPermission(recording.permission())));
+        }
+        playerSnapshots.replaceAll(replacement);
+    }
+
+    private void refreshPlayerSnapshot(Player player) {
+        PluginSettings.Recording recording = settings.recording();
+        playerSnapshots.put(player.getUniqueId(), player.getName(),
+                recording.permission().isBlank() || player.hasPermission(recording.permission()));
+    }
+
     private boolean captureAllowed(UUID playerId) {
-        return !capturePaused && (!settings.recording().privacyNotice()
+        return consentReady && !capturePaused && (!settings.recording().privacyNotice()
                 || privacyNotifiedPlayers.contains(playerId));
     }
 

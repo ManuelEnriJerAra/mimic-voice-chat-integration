@@ -84,7 +84,7 @@ the two permissions used by the plugin.
 1. Copies the packaged default configuration to the plugin data directory if it
    is not already present.
 2. Parses the configuration into a volatile `PluginSettings` object.
-3. Loads `recording-opt-outs.yml` through `ConsentRegistry`.
+3. Starts the asynchronous `ConsentRegistry` load for `recording-opt-outs.yml`.
 4. Creates a `ClipStore` rooted at the plugin's `recordings` directory.
 5. Creates the `VoiceRecordingManager` and the Simple Voice Chat addon.
 6. Looks up the `BukkitVoicechatService`. If it is unavailable, the plugin logs
@@ -93,8 +93,11 @@ the two permissions used by the plugin.
 8. Creates and starts the `MimicPlaybackManager`, which scans for Mimics once per
    second.
 9. Registers Bukkit join/quit listeners and the `/mimicvoice` command executor.
-10. Sends privacy notices to any players already online, then enables capture.
-11. Starts asynchronous clip loading from disk.
+10. Starts the bounded player-metadata snapshot task used by the microphone
+    callback.
+11. Starts asynchronous clip loading from disk. Capture remains paused until the
+    consent load completes successfully; then notices are sent to online players
+    and capture is enabled on the Bukkit thread.
 
 Clip loading happens after the other services are started on the storage executor.
 Playback can therefore be ticking briefly before persisted clips have finished
@@ -105,9 +108,9 @@ loading; during that period no loaded clips are available for selection.
 `onDisable()` first makes the voice-chat addon inert and unregisters its volume
 category, then stops playback and closes recording sessions. The recording
 worker drains the already accepted bounded packet queue in FIFO order, flushes
-active sessions, closes their Opus decoders, and terminates before the storage
-executor is closed. New packets are rejected once shutdown begins. The storage
-executor is then given up to ten seconds to finish queued WAV writes.
+active sessions, closes their Opus decoders, and terminates before storage is
+closed. New packets are rejected once shutdown begins. Consent, bounded playback
+reads, and bounded storage work are then closed on their respective workers.
 
 ### Join and quit behavior
 
@@ -342,10 +345,12 @@ same per-player maximum still applies, but all clips disappear on restart. A
 global `storage.maximum-memory-audio-megabytes` limit also bounds the total
 memory-only PCM pool; the oldest memory clips are evicted when it is exceeded.
 
-The storage executor is single-threaded. It serializes file writes, startup
-scanning, reads, deletions, quarantine moves, and five-minute retention passes so
-filesystem operations do not run on the Bukkit main thread. Completed PCM save
-submissions are bounded by both 256 pending entries and
+Storage file work is isolated from the Bukkit main thread. A single bounded
+storage worker serializes file writes, startup scanning, deletions, quarantine
+moves, and retention passes; a separate single bounded read worker handles disk
+playback reads. The storage work queue is bounded, and playback admission is
+bounded at 64 pending reads. Completed PCM save submissions are bounded by both
+256 pending entries and
 `storage.maximum-pending-write-megabytes` (64 MiB by default). Admission is
 non-blocking: a clip that would exceed either bound is rejected and counted as a
 backpressure rejection. The PCM array returned by the segmenter is transferred
@@ -500,15 +505,17 @@ but excluded by `ClipStore.select()`; the default is one second.
 
 If playback is disabled, the voice API disappears, the entity is removed, or
 configuration is reloaded, active audio is stopped and in-flight loads are
-invalidated through an identity version counter. A clip read started for one
-identity is checked again on the Bukkit thread before it can start, so it cannot
-play after the entity changes to another identity.
+invalidated through an identity version counter. The clear commands perform the
+same invalidation before deleting accepted/quarantined clips, so an active
+playback stops and a pending read cannot start after the clear. A clip read
+started for one identity is checked again on the Bukkit thread before it can
+start, so it cannot play after the entity changes to another identity.
 
 ## 11. Commands and permissions
 
 | Command | Who can use it | Behavior |
 | --- | --- | --- |
-| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending-write count/bytes, successful/failed saves, backpressure rejections, and memory-audio bytes |
+| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending-write count/bytes, pending playback reads, successful/failed saves, save/read backpressure rejections, and memory-audio bytes |
 | `/mimicvoice reload` | `mimicvoice.admin` | Reloads `config.yml`, flushes or discards capture sessions depending on the new recording setting, and resets playback states |
 | `/mimicvoice clear <player>` | `mimicvoice.admin` | Removes accepted and quarantined clips for an online name or a name known by the clip index |
 | `/mimicvoice clear all` | `mimicvoice.admin` | Removes all indexed accepted clips and all quarantined WAV files |
@@ -520,8 +527,10 @@ The command alias is `/mvc`. `mimicvoice.admin` defaults to operators, while
 `mimicvoice.record` defaults to all players.
 
 The clear operations are asynchronous because file deletion runs on the storage
-executor. The confirmation message is sent back on the Bukkit thread after the
-operation completes.
+executor. Playback state is invalidated immediately on the Bukkit thread before
+deletion is queued; the confirmation message is sent back on the Bukkit thread
+after the operation completes. A capture already in progress may still produce
+a later clip unless recording is denied or disabled.
 
 ## 12. Configuration reference
 
@@ -592,15 +601,17 @@ file work:
 
 - Bukkit's main thread handles plugin lifecycle, commands, entity scanning,
   playback creation, and location updates.
-- The Simple Voice Chat microphone callback performs basic eligibility checks,
-  copies the owned Opus payload, captures UUID/name/whisper/generation metadata,
-  offers a `PacketWork` item to a bounded `ArrayBlockingQueue`, and returns. It
-  never decodes, runs VAD, touches files, or waits for the worker.
+- The Simple Voice Chat microphone callback reads only the sender UUID and an
+  immutable player snapshot, copies the owned Opus payload, captures
+  UUID/name/whisper/generation metadata, offers a `PacketWork` item to a bounded
+  `ArrayBlockingQueue`, and returns. It never calls Bukkit `Player` methods,
+  decodes, runs VAD, touches files, or waits for the worker.
 - One daemon platform thread named `mimic-voice-capture-worker` owns all
   `CaptureSession` objects, decoders, segmenters, FIFO packet processing, and
   100 ms idle/expiry maintenance. It never receives a Bukkit `Player` object.
-- A daemon single-thread storage executor named `mimic-voice-storage` handles
-  WAV I/O, clip indexing work, scheduled retention, and deletion. Pending PCM
+- A daemon bounded storage worker named `mimic-voice-storage` handles WAV I/O,
+  clip indexing work, retention, and deletion. A separate bounded
+  `mimic-voice-read` worker admits at most 64 pending disk reads. Pending PCM
   save arrays are capped at 256 entries and the configured pending-write byte
   budget; admission is non-blocking and rejected work is counted separately from
   actual storage failures.
@@ -616,12 +627,13 @@ already processed into the active session.
 
 On plugin shutdown, no new packets are accepted. The capture worker drains its
 accepted queue, flushes active sessions, closes decoders, and is joined for up
-to ten seconds (with a final interrupt/warning fallback). The storage executor
-is closed afterward and gets its own ten-second completion window.
+to ten seconds (with a final interrupt/warning fallback that clears queued work).
+Bounded read and storage workers are then closed with their own completion
+windows.
 
 ## 14. Automated tests
 
-The current test suite contains 69 passing tests:
+The current test suite contains 76 passing tests:
 
 - `WavIOTest` verifies 48 kHz mono PCM write/read round-tripping and temporary
   file cleanup after a successful write.
@@ -633,14 +645,15 @@ The current test suite contains 69 passing tests:
   oldest-clip eviction, quarantine of persisted sparse noise, quarantine
   retention, offline quarantined-name indexing, accepted/quarantined clear
   behavior, bounded pending-write accounting, failed-save cleanup, FIFO clear
-  ordering, global memory-only eviction, defensive caller-array ownership, and
-  corrupt playback-file quarantine.
+  ordering, global memory-only eviction, defensive caller-array ownership,
+  bounded disk-read admission, and corrupt playback-file quarantine.
 - `PendingAudioBudgetTest` verifies non-blocking admission against both the
   pending-entry and pending-byte limits.
 - `ConsentRegistryTest` verifies durable opt-out/opt-in round-trips, temporary
   file cleanup, and explicit persistence-failure reporting.
 - `MimicVoicechatAddonTest` verifies shutdown makes the addon inert and removes
-  its registered volume category.
+  its registered volume category, and verifies microphone admission uses the
+  immutable UUID/snapshot boundary without Bukkit `Player` access.
 - `MimicIdentityResolverTest` verifies UUID precedence, exact online-name and
   persisted-name compatibility, malformed-marker handling, custom-name
   compatibility, and the absence of cross-player fallback.
@@ -650,8 +663,9 @@ The current test suite contains 69 passing tests:
 - `MimicPlaybackControllerTest` verifies the playback boundary independently of
   Bukkit: Mimic filtering, exact UUID ownership, legacy resolved-name input,
   delay boundaries, listener gating, no-clip retry, identity/load generation
-  invalidation, removal/reload/API/setting shutdown, channel-follow updates,
-  gain clamping, alternate-clip selection, idempotent close, and main-thread
+  invalidation, removal/reload/API/setting shutdown, clear invalidation and
+  active-stop behavior, channel-follow updates, gain clamping, alternate-clip
+  selection, cleanup after a throwing stop, idempotent close, and main-thread
   dispatch of storage completions.
 - `MimicVoicePipelineComponentTest` combines the real voice activity segmenter,
   asynchronous `ClipStore` save/index, UUID-targeted selection, and the
@@ -659,8 +673,9 @@ The current test suite contains 69 passing tests:
 - `VoiceRecordingManagerTest` verifies callback offload, per-player FIFO order,
   single-decoder serialization, bounded overflow recovery, consent-denial and
   finish/quit barriers, reload invalidation, normal accepted capture, idempotent
-  worker shutdown, separate speech-acceptance/submission-failure counters, and a
-  2,000-packet bounded-queue stress path.
+  worker shutdown, atomic generation/save admission, fatal-queue cleanup,
+  separate speech-acceptance/submission-failure counters, and a 2,000-packet
+  bounded-queue stress path.
 
 The deterministic tests do not run an actual Paper server, Simple Voice Chat
 server, Mimic entity, or networked client. Bukkit scanning, plugin lifecycle,
@@ -698,7 +713,8 @@ These details are important when diagnosing behavior or extending the plugin:
    transmission is not cancelled.
 4. **Clearing clips does not cancel an active capture session.** If a player is
    currently speaking, a later completed phrase can be saved after an admin has
-   cleared that player's existing pool. Use consent denial or disable recording
+   cleared that player's existing pool. Clear does stop active playback and
+   invalidates pending playback reads. Use consent denial or disable recording
    when the unfinished capture must also be discarded.
 5. **Invalid files found during playback reads are removed from active playback.**
    A read failure returns no samples, removes the clip from the active index, and

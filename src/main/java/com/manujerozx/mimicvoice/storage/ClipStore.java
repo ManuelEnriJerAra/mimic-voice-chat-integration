@@ -15,9 +15,9 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,35 +34,91 @@ import com.manujerozx.mimicvoice.audio.WavIO;
 public final class ClipStore implements AutoCloseable {
 
     private static final int MAX_PENDING_SAVES = 256;
+    static final int MAX_PENDING_READS = 64;
 
     private final Path root;
     private final Path quarantineRoot;
     private final Logger logger;
     private final Supplier<PluginSettings> settings;
-    private final ScheduledExecutorService ioExecutor;
+    private final ThreadPoolExecutor ioExecutor;
+    private final ThreadPoolExecutor readExecutor;
+    private final Thread maintenanceThread;
+    private final WavReader wavReader;
     private final PendingAudioBudget pendingAudioBudget = new PendingAudioBudget(MAX_PENDING_SAVES);
     private final Set<PendingSave> pendingSaves = ConcurrentHashMap.newKeySet();
     private final AtomicLong rejectedBackpressureCount = new AtomicLong();
     private final AtomicLong failedSaveCount = new AtomicLong();
     private final AtomicLong successfulSaveCount = new AtomicLong();
     private final AtomicLong lastBackpressureLogAt = new AtomicLong();
+    private final AtomicLong rejectedReadCount = new AtomicLong();
+    private final AtomicLong lastReadBackpressureLogAt = new AtomicLong();
     private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
     private final Map<String, UUID> playersByName = new ConcurrentHashMap<>();
+    private final Set<PendingRead> pendingReads = ConcurrentHashMap.newKeySet();
     private volatile boolean closed;
 
     public ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings) {
+        this(root, logger, settings, WavIO::read);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings, WavReader wavReader) {
         this.root = root;
         this.quarantineRoot = root.resolve("_rejected_noise");
         this.logger = logger;
         this.settings = settings;
-        this.ioExecutor = Executors.newSingleThreadScheduledExecutor(runnable ->
-                Thread.ofPlatform().name("mimic-voice-storage").daemon(true).unstarted(runnable));
-        this.ioExecutor.scheduleWithFixedDelay(this::runRetentionMaintenance,
-                5L, 5L, TimeUnit.MINUTES);
+        this.wavReader = wavReader;
+        this.ioExecutor = boundedExecutor("mimic-voice-storage", MAX_PENDING_SAVES);
+        // The worker itself occupies one slot, so the queue has one fewer
+        // entries than the public pending-read bound.
+        this.readExecutor = boundedExecutor("mimic-voice-read", MAX_PENDING_READS - 1);
+        this.maintenanceThread = Thread.ofPlatform().name("mimic-voice-storage-maintenance")
+                .daemon(true).unstarted(this::runMaintenanceLoop);
+        this.maintenanceThread.start();
+    }
+
+    private static ThreadPoolExecutor boundedExecutor(String name, int queueCapacity) {
+        return new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(queueCapacity),
+                runnable -> Thread.ofPlatform().name(name).daemon(true).unstarted(runnable),
+                new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    private <T> CompletableFuture<T> submitIo(java.util.function.Supplier<T> task) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        try {
+            ioExecutor.execute(() -> {
+                try {
+                    result.complete(task.get());
+                } catch (Throwable failure) {
+                    result.completeExceptionally(failure);
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            result.completeExceptionally(exception);
+        }
+        return result;
+    }
+
+    private void runMaintenanceLoop() {
+        try {
+            while (!closed) {
+                Thread.sleep(TimeUnit.MINUTES.toMillis(5L));
+                if (closed) {
+                    return;
+                }
+                submitIo(() -> {
+                    runRetentionMaintenance();
+                    return null;
+                });
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     public CompletableFuture<Integer> initialize() {
-        return CompletableFuture.supplyAsync(this::loadPersistedClips, ioExecutor);
+        return submitIo(this::loadPersistedClips);
     }
 
     /** Queues a save without blocking and defensively owns caller-provided samples. */
@@ -139,22 +195,23 @@ public final class ClipStore implements AutoCloseable {
         if (clip.memoryAudio() != null) {
             return CompletableFuture.completedFuture(clip.memoryAudio().clone());
         }
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                WavIO.WavData data = WavIO.read(clip.path());
-                if (data.sampleRate() != PluginSettings.SAMPLE_RATE) {
-                    throw new IOException("Unexpected sample rate " + data.sampleRate());
-                }
-                return data.samples();
-            } catch (IOException | RuntimeException exception) {
-                invalidateUnreadableClip(clip, exception);
-                return null;
-            }
-        }, ioExecutor);
+        if (closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        CompletableFuture<short[]> result = new CompletableFuture<>();
+        PendingRead pending = new PendingRead(clip, result);
+        pendingReads.add(pending);
+        try {
+            readExecutor.execute(pending);
+        } catch (RejectedExecutionException exception) {
+            pending.cancel();
+            rejectReadForBackpressure();
+        }
+        return result;
     }
 
     public CompletableFuture<Integer> clearAll() {
-        return CompletableFuture.supplyAsync(() -> {
+        return submitIo(() -> {
             int acceptedCount = clipCount();
             List<VoiceClip> snapshot = allClips();
             clips.clear();
@@ -163,11 +220,11 @@ public final class ClipStore implements AutoCloseable {
             int quarantinedCount = deleteQuarantinedFiles(null);
             removeEmptyDirectories();
             return acceptedCount + quarantinedCount;
-        }, ioExecutor);
+        });
     }
 
     public CompletableFuture<Integer> clearPlayer(UUID playerId) {
-        return CompletableFuture.supplyAsync(() -> {
+        return submitIo(() -> {
             List<VoiceClip> removed = clips.remove(playerId);
             int acceptedCount = 0;
             if (removed != null) {
@@ -178,7 +235,7 @@ public final class ClipStore implements AutoCloseable {
             int quarantinedCount = deleteQuarantinedFiles(playerId);
             removeEmptyDirectories();
             return acceptedCount + quarantinedCount;
-        }, ioExecutor);
+        });
     }
 
     public UUID findPlayerId(String playerName) {
@@ -220,6 +277,14 @@ public final class ClipStore implements AutoCloseable {
                 .sum();
     }
 
+    public int pendingReadCount() {
+        return pendingReads.size();
+    }
+
+    public long readRejectedBackpressure() {
+        return rejectedReadCount.get();
+    }
+
     /**
      * Places a FIFO barrier after currently queued storage work.
      *
@@ -227,13 +292,7 @@ public final class ClipStore implements AutoCloseable {
      * asynchronous storage boundary with playback selection.</p>
      */
     public CompletableFuture<Void> awaitIdle() {
-        CompletableFuture<Void> barrier = new CompletableFuture<>();
-        try {
-            ioExecutor.execute(() -> barrier.complete(null));
-        } catch (RejectedExecutionException exception) {
-            barrier.completeExceptionally(exception);
-        }
-        return barrier;
+        return submitIo(() -> null);
     }
 
     private int loadPersistedClips() {
@@ -308,6 +367,19 @@ public final class ClipStore implements AutoCloseable {
                     data.samples().length, createdAt));
         } catch (IOException | RuntimeException exception) {
             quarantineInvalidPersistedClip(path, playerId, exception);
+        }
+    }
+
+    private short[] readNow(VoiceClip clip) {
+        try {
+            WavIO.WavData data = wavReader.read(clip.path());
+            if (data.sampleRate() != PluginSettings.SAMPLE_RATE) {
+                throw new IOException("Unexpected sample rate " + data.sampleRate());
+            }
+            return data.samples();
+        } catch (IOException | RuntimeException exception) {
+            invalidateUnreadableClip(clip, exception);
+            return null;
         }
     }
 
@@ -423,6 +495,16 @@ public final class ClipStore implements AutoCloseable {
                 && lastBackpressureLogAt.compareAndSet(previous, now)) {
             logger.warning("Voice clip storage backpressure rejected a clip for "
                     + safePlayerName(playerName));
+        }
+    }
+
+    private void rejectReadForBackpressure() {
+        rejectedReadCount.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long previous = lastReadBackpressureLogAt.get();
+        if ((previous == 0L || now - previous >= 10_000L)
+                && lastReadBackpressureLogAt.compareAndSet(previous, now)) {
+            logger.warning("Voice clip playback read backpressure rejected a read; playback will retry later.");
         }
     }
 
@@ -664,20 +746,66 @@ public final class ClipStore implements AutoCloseable {
         }
     }
 
+    private final class PendingRead implements Runnable {
+        private final VoiceClip clip;
+        private final CompletableFuture<short[]> result;
+        private final AtomicBoolean completed = new AtomicBoolean();
+
+        private PendingRead(VoiceClip clip, CompletableFuture<short[]> result) {
+            this.clip = clip;
+            this.result = result;
+        }
+
+        @Override
+        public void run() {
+            try {
+                result.complete(readNow(clip));
+            } finally {
+                complete();
+            }
+        }
+
+        private void cancel() {
+            result.complete(null);
+            complete();
+        }
+
+        private void complete() {
+            if (completed.compareAndSet(false, true)) {
+                pendingReads.remove(this);
+            }
+        }
+    }
+
     @Override
     public void close() {
         closed = true;
+        maintenanceThread.interrupt();
+        readExecutor.shutdown();
         ioExecutor.shutdown();
         try {
+            maintenanceThread.join(1_000L);
+            if (!readExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                logger.warning("Voice clip reads did not finish before shutdown.");
+                readExecutor.shutdownNow();
+                pendingReads.forEach(PendingRead::cancel);
+            }
             if (!ioExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
                 logger.warning("Voice clip storage did not finish all pending work before shutdown.");
                 ioExecutor.shutdownNow();
                 pendingSaves.forEach(PendingSave::cancel);
             }
         } catch (InterruptedException exception) {
+            readExecutor.shutdownNow();
             ioExecutor.shutdownNow();
+            pendingReads.forEach(PendingRead::cancel);
             pendingSaves.forEach(PendingSave::cancel);
             Thread.currentThread().interrupt();
         }
+    }
+
+    @FunctionalInterface
+    interface WavReader {
+        WavIO.WavData read(Path path) throws IOException;
     }
 }

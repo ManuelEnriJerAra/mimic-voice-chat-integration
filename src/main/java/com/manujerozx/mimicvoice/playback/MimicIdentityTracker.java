@@ -40,6 +40,7 @@ public final class MimicIdentityTracker {
     public void invalidate() {
         identityVersion++;
         loading = false;
+        lastClipId = null;
     }
 
     public boolean isCurrent(long version, MimicIdentityResolver.IdentityKey expectedIdentity) {

@@ -31,6 +31,7 @@ final class MimicPlaybackController implements AutoCloseable {
     private final MainThreadExecutor mainThread;
     private final Clock clock;
     private final DelaySource delays;
+    private final Consumer<RuntimeException> failureReporter;
     private final Map<UUID, State> states = new HashMap<>();
     private final Map<UUID, Target> currentTargets = new HashMap<>();
     private boolean closed;
@@ -42,12 +43,24 @@ final class MimicPlaybackController implements AutoCloseable {
                             MainThreadExecutor mainThread,
                             Clock clock,
                             DelaySource delays) {
+        this(settings, clips, playbackSink, mainThread, clock, delays, ignored -> {
+        });
+    }
+
+    MimicPlaybackController(Supplier<PluginSettings> settings,
+                            ClipSource clips,
+                            PlaybackSink playbackSink,
+                            MainThreadExecutor mainThread,
+                            Clock clock,
+                            DelaySource delays,
+                            Consumer<RuntimeException> failureReporter) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.clips = Objects.requireNonNull(clips, "clips");
         this.playbackSink = Objects.requireNonNull(playbackSink, "playbackSink");
         this.mainThread = Objects.requireNonNull(mainThread, "mainThread");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.delays = Objects.requireNonNull(delays, "delays");
+        this.failureReporter = Objects.requireNonNull(failureReporter, "failureReporter");
     }
 
     void tick(Collection<Target> discovered, boolean voiceApiAvailable) {
@@ -94,6 +107,33 @@ final class MimicPlaybackController implements AutoCloseable {
             state.identity.invalidate();
             state.identity.setNextPlaybackAt(now);
             stop(state);
+        }
+    }
+
+    /** Invalidates reads and active playback for every currently tracked Mimic. */
+    void invalidateAll() {
+        if (closed) {
+            return;
+        }
+        long now = clock.nowMillis();
+        for (State state : states.values()) {
+            invalidateForClear(state, now);
+        }
+    }
+
+    /** Invalidates reads and active playback for Mimics currently using a player. */
+    void invalidatePlayer(UUID playerId) {
+        if (closed || playerId == null) {
+            return;
+        }
+        long now = clock.nowMillis();
+        for (Map.Entry<UUID, Target> entry : currentTargets.entrySet()) {
+            if (Objects.equals(entry.getValue().playerId(), playerId)) {
+                State state = states.get(entry.getKey());
+                if (state != null) {
+                    invalidateForClear(state, now);
+                }
+            }
         }
     }
 
@@ -277,7 +317,27 @@ final class MimicPlaybackController implements AutoCloseable {
         if (state.playback != null) {
             PlaybackHandle playback = state.playback;
             state.playback = null;
-            playback.stop();
+            try {
+                playback.stop();
+            } catch (RuntimeException exception) {
+                reportFailure(exception);
+            }
+        }
+    }
+
+    private void invalidateForClear(State state, long now) {
+        PluginSettings.Playback playbackSettings = settings.get().playback();
+        state.identity.invalidate();
+        state.identity.setNextPlaybackAt(now
+                + playbackSettings.retryWithoutClipSeconds() * 1_000L);
+        stop(state);
+    }
+
+    private void reportFailure(RuntimeException exception) {
+        try {
+            failureReporter.accept(exception);
+        } catch (RuntimeException ignored) {
+            // A failure reporter must never break playback cleanup.
         }
     }
 
