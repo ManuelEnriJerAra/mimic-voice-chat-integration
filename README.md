@@ -92,6 +92,12 @@ discards their unfinished capture. Consent changes are saved with atomic file
 replacement, and a player is warned if persistence fails. Existing accepted and
 quarantined clips can be removed with the admin clear command.
 
+`/mimicvoice status` also reports the bounded capture queue depth/capacity,
+received and processed packet counts, overload drops, accepted speech segments,
+pending storage saves, and clip/storage submission failures. If recording is
+overloaded, the plugin drops recording work and resets that capture session
+without interrupting normal voice transmission.
+
 Voice recording laws and platform rules vary. The default join notice tells
 players what is happening and how to opt out; server owners are responsible for
 providing any additional notice or consent flow their jurisdiction requires.

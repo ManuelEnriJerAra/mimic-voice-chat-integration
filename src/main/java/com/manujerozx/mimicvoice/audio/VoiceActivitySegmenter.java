@@ -2,6 +2,7 @@ package com.manujerozx.mimicvoice.audio;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 
@@ -34,13 +35,21 @@ public final class VoiceActivitySegmenter {
      * Accepts one decoded packet. Returns a completed speech clip, or {@code null}.
      */
     public short[] accept(short[] samples) {
-        if (samples == null || samples.length == 0) {
+        return samples == null ? null : accept(samples, 0, samples.length);
+    }
+
+    /**
+     * Accepts a range of a decoder-owned PCM buffer. The range is copied once because
+     * active phrases retain frames beyond the decoder call's ownership boundary.
+     */
+    public short[] accept(short[] samples, int offset, int length) {
+        if (samples == null || length <= 0 || offset < 0 || offset > samples.length - length) {
             return null;
         }
 
-        short[] frame = samples.clone();
-        double rmsDb = rmsDb(frame);
-        double peakDb = peakDb(frame);
+        short[] frame = Arrays.copyOfRange(samples, offset, offset + length);
+        double rmsDb = rmsDb(samples, offset, length);
+        double peakDb = peakDb(samples, offset, length);
         boolean speech = isSpeech(rmsDb, peakDb, active);
 
         if (!active) {
@@ -163,18 +172,34 @@ public final class VoiceActivitySegmenter {
     }
 
     static double rmsDb(short[] samples) {
+        return rmsDb(samples, 0, samples == null ? 0 : samples.length);
+    }
+
+    static double rmsDb(short[] samples, int offset, int length) {
+        if (samples == null || length <= 0) {
+            return -96.0;
+        }
         double sum = 0.0;
-        for (short sample : samples) {
+        for (int index = offset; index < offset + length; index++) {
+            short sample = samples[index];
             double normalized = sample / 32768.0;
             sum += normalized * normalized;
         }
-        double rms = Math.sqrt(sum / samples.length);
+        double rms = Math.sqrt(sum / length);
         return rms <= 1.0e-9 ? -96.0 : 20.0 * Math.log10(rms);
     }
 
     static double peakDb(short[] samples) {
+        return peakDb(samples, 0, samples == null ? 0 : samples.length);
+    }
+
+    static double peakDb(short[] samples, int offset, int length) {
+        if (samples == null || length <= 0) {
+            return -96.0;
+        }
         int peak = 0;
-        for (short sample : samples) {
+        for (int index = offset; index < offset + length; index++) {
+            short sample = samples[index];
             peak = Math.max(peak, Math.abs((int) sample));
         }
         double normalized = peak / 32768.0;

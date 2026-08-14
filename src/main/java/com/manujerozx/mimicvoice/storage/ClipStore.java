@@ -15,9 +15,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -29,11 +32,16 @@ import com.manujerozx.mimicvoice.audio.WavIO;
 
 public final class ClipStore implements AutoCloseable {
 
+    private static final int MAX_PENDING_SAVES = 256;
+
     private final Path root;
     private final Path quarantineRoot;
     private final Logger logger;
     private final Supplier<PluginSettings> settings;
     private final ScheduledExecutorService ioExecutor;
+    private final Semaphore pendingSavePermits = new Semaphore(MAX_PENDING_SAVES);
+    private final AtomicLong rejectedSaveCount = new AtomicLong();
+    private final AtomicLong failedSaveCount = new AtomicLong();
     private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
     private final Map<String, UUID> playersByName = new ConcurrentHashMap<>();
 
@@ -52,12 +60,59 @@ public final class ClipStore implements AutoCloseable {
         return CompletableFuture.supplyAsync(this::loadPersistedClips, ioExecutor);
     }
 
-    public void save(UUID playerId, String playerName, short[] samples) {
+    /**
+     * Queues a save without blocking the caller. The PCM save backlog is explicitly
+     * bounded so capture cannot retain an unbounded number of cloned clips in memory.
+     * This public entry point keeps ownership by cloning caller-provided samples.
+     *
+     * @return {@code true} when the save was accepted by the storage queue
+     */
+    public boolean save(UUID playerId, String playerName, short[] samples) {
+        return submitSave(playerId, playerName, samples, false);
+    }
+
+    /**
+     * Queues a save while taking ownership of the supplied PCM array. The capture
+     * worker uses this only for a freshly completed segmenter result, which is not
+     * referenced after submission, so the async storage boundary does not need a
+     * second full PCM copy.
+     *
+     * @return {@code true} when the save was accepted by the storage queue
+     */
+    public boolean saveOwned(UUID playerId, String playerName, short[] samples) {
+        return submitSave(playerId, playerName, samples, true);
+    }
+
+    private boolean submitSave(UUID playerId, String playerName, short[] samples, boolean owned) {
         if (samples == null || samples.length == 0) {
-            return;
+            return false;
         }
-        short[] ownedSamples = samples.clone();
-        CompletableFuture.runAsync(() -> saveNow(playerId, playerName, ownedSamples), ioExecutor);
+        if (!pendingSavePermits.tryAcquire()) {
+            rejectedSaveCount.incrementAndGet();
+            logger.warning("Voice clip storage save queue is full; dropping a completed clip for "
+                    + safePlayerName(playerName));
+            return false;
+        }
+        short[] ownedSamples = owned ? samples : samples.clone();
+        try {
+            CompletableFuture.runAsync(() -> {
+                try {
+                    saveNow(playerId, playerName, ownedSamples);
+                } catch (RuntimeException exception) {
+                    failedSaveCount.incrementAndGet();
+                    logger.log(Level.WARNING, "Could not save speech clip for "
+                            + safePlayerName(playerName), exception);
+                } finally {
+                    pendingSavePermits.release();
+                }
+            }, ioExecutor);
+            return true;
+        } catch (RejectedExecutionException exception) {
+            pendingSavePermits.release();
+            rejectedSaveCount.incrementAndGet();
+            logger.log(Level.WARNING, "Could not queue voice clip storage work", exception);
+            return false;
+        }
     }
 
     public VoiceClip select(UUID playerId, String previousClipId) {
@@ -136,6 +191,14 @@ public final class ClipStore implements AutoCloseable {
 
     public int playerCount() {
         return (int) clips.values().stream().filter(list -> !list.isEmpty()).count();
+    }
+
+    public int pendingSaveCount() {
+        return MAX_PENDING_SAVES - pendingSavePermits.availablePermits();
+    }
+
+    public long saveFailures() {
+        return rejectedSaveCount.get() + failedSaveCount.get();
     }
 
     private int loadPersistedClips() {
@@ -228,6 +291,7 @@ public final class ClipStore implements AutoCloseable {
             register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
             enforcePlayerLimit(playerId);
         } catch (IOException exception) {
+            failedSaveCount.incrementAndGet();
             logger.log(Level.WARNING, "Could not save speech clip for " + safeName, exception);
         }
     }

@@ -20,7 +20,7 @@ public final class ConsentRegistry {
 
     private final File file;
     private final Logger logger;
-    private final Set<UUID> optedOut = new HashSet<>();
+    private volatile Set<UUID> optedOut = Set.of();
 
     public ConsentRegistry(File dataFolder, Logger logger) {
         this.file = new File(dataFolder, "recording-opt-outs.yml");
@@ -28,7 +28,7 @@ public final class ConsentRegistry {
         load();
     }
 
-    public synchronized boolean mayRecord(UUID playerId) {
+    public boolean mayRecord(UUID playerId) {
         return !optedOut.contains(playerId);
     }
 
@@ -36,29 +36,32 @@ public final class ConsentRegistry {
      * Applies a consent change immediately and returns whether it was durably saved.
      */
     public synchronized boolean setAllowed(UUID playerId, boolean allowed) {
+        Set<UUID> updated = new HashSet<>(optedOut);
         if (allowed) {
-            optedOut.remove(playerId);
+            updated.remove(playerId);
         } else {
-            optedOut.add(playerId);
+            updated.add(playerId);
         }
-        return save();
+        optedOut = Set.copyOf(updated);
+        return save(updated);
     }
 
     private synchronized void load() {
-        optedOut.clear();
+        Set<UUID> loaded = new HashSet<>();
         YamlConfiguration yaml = YamlConfiguration.loadConfiguration(file);
         for (String serialized : yaml.getStringList("opted-out")) {
             try {
-                optedOut.add(UUID.fromString(serialized));
+                loaded.add(UUID.fromString(serialized));
             } catch (IllegalArgumentException ignored) {
                 logger.warning("Ignoring invalid UUID in " + file.getName() + ": " + serialized);
             }
         }
+        optedOut = Set.copyOf(loaded);
     }
 
-    private synchronized boolean save() {
+    private boolean save(Set<UUID> snapshot) {
         YamlConfiguration yaml = new YamlConfiguration();
-        yaml.set("opted-out", optedOut.stream().map(UUID::toString).sorted().toList());
+        yaml.set("opted-out", snapshot.stream().map(UUID::toString).sorted().toList());
         Path target = file.toPath();
         Path temporary = target.resolveSibling(file.getName() + ".tmp-" + UUID.randomUUID());
         try {

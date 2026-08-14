@@ -101,11 +101,12 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         privacyNotifiedPlayers.remove(event.getPlayer().getUniqueId());
-        recordingManager.finish(event.getPlayer().getUniqueId());
+        recordingManager.endPlayer(event.getPlayer().getUniqueId());
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
+        recordingManager.resumePlayer(event.getPlayer().getUniqueId());
         sendPrivacyNotice(event.getPlayer());
     }
 
@@ -190,8 +191,14 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 + playbackManager.trackedMimics() + "; playing: "
                 + playbackManager.activePlaybacks() + "; total playbacks: "
                 + playbackManager.startedPlaybacks() + ".", NamedTextColor.GRAY));
-        sender.sendMessage(Component.text("Packets processed: " + recordingManager.receivedPackets()
-                + "; speech clips accepted: " + recordingManager.savedClips() + ".",
+        sender.sendMessage(Component.text("Capture queue: " + recordingManager.queueDepth() + "/"
+                + recordingManager.queueCapacity() + "; packets received: "
+                + recordingManager.receivedPackets() + "; processed: " + recordingManager.processedPackets()
+                + "; overload drops: " + recordingManager.overloadDroppedPackets()
+                + "; accepted speech segments: " + recordingManager.savedClips()
+                + "; clip submission failures: " + recordingManager.saveFailures()
+                + "; pending storage saves: " + clipStore.pendingSaveCount()
+                + "; storage failures: " + clipStore.saveFailures() + ".",
                 NamedTextColor.GRAY));
     }
 

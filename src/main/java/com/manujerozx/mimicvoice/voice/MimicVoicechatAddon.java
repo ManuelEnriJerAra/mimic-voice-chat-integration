@@ -61,6 +61,7 @@ public final class MimicVoicechatAddon implements VoicechatPlugin, AutoCloseable
         }
         VoicechatServerApi api = event.getVoicechat();
         serverApi = api;
+        recordingManager.resume();
         api.registerVolumeCategory(api.volumeCategoryBuilder()
                 .setId(VOLUME_CATEGORY)
                 .setName("Mimic voices")
@@ -74,7 +75,7 @@ public final class MimicVoicechatAddon implements VoicechatPlugin, AutoCloseable
             return;
         }
         serverApi = null;
-        recordingManager.reload();
+        recordingManager.pause();
     }
 
     public VoicechatServerApi serverApi() {
