@@ -319,6 +319,34 @@ class MimicPlaybackControllerTest {
     }
 
     @Test
+    void activePlaybackPcmBudgetRejectsExcessAndReleasesOnStop() {
+        try (Harness harness = new Harness(settingsWithActivePcmBytes(true, 0, 0, 0, 0, 0, 5, 6L))) {
+            harness.delays.add(0L);
+            VoiceClip clipA = clip("a", PLAYER_A);
+            VoiceClip clipB = clip("b", PLAYER_B);
+            harness.clips.add(PLAYER_A, clipA);
+            harness.clips.add(PLAYER_B, clipB);
+            MimicPlaybackController.Target targetA = target(ENTITY_ID, PLAYER_A, "Alice", 1,
+                    MimicIdentityResolver.Source.UUID_MARKER);
+            MimicPlaybackController.Target targetB = target(ENTITY_B, PLAYER_B, "Bob", 1,
+                    MimicIdentityResolver.Source.UUID_MARKER);
+
+            harness.tick(targetA, targetB);
+            harness.completeRead(clipA, new short[] {1, 2, 3});
+            harness.completeRead(clipB, new short[] {4, 5, 6});
+            harness.main.runAll();
+
+            assertEquals(1, harness.sink.started.size());
+            assertEquals(Short.BYTES * 3L, harness.controller.activePlaybackPcmBytes());
+            assertEquals(1, harness.controller.playbackPcmRejections());
+
+            harness.sink.lastPlayback.complete();
+            harness.main.runAll();
+            assertEquals(0L, harness.controller.activePlaybackPcmBytes());
+        }
+    }
+
+    @Test
     void gainClampsToSigned16BitRange() {
         short[] adjusted = MimicPlaybackController.applyGain(
                 new short[] {Short.MAX_VALUE, Short.MIN_VALUE, 10_000}, 2.0);
@@ -428,6 +456,21 @@ class MimicPlaybackControllerTest {
                         repeatMinimum, repeatMaximum, retrySeconds));
     }
 
+    private static PluginSettings settingsWithActivePcmBytes(boolean enabled, int minimumListeners,
+                                                              int firstMinimum, int firstMaximum,
+                                                              int repeatMinimum, int repeatMaximum,
+                                                              int retrySeconds, long maximumActiveBytes) {
+        PluginSettings.VoiceActivity activity = new PluginSettings.VoiceActivity(
+                -42.0, -32.0, 10.0, 5.0,
+                0, 40, 20, 20, 0.25, 10, 1_000);
+        return new PluginSettings(
+                new PluginSettings.Recording(true, true, "", false, activity),
+                new PluginSettings.Storage(false, 20, 72),
+                new PluginSettings.Playback(enabled, 32.0F, 1.0, 0.01,
+                        minimumListeners, firstMinimum, firstMaximum,
+                        repeatMinimum, repeatMaximum, retrySeconds, maximumActiveBytes));
+    }
+
     private static final class Harness implements AutoCloseable {
         private final MutableClock clock = new MutableClock();
         private final DelaySequence delays = new DelaySequence();
@@ -456,7 +499,11 @@ class MimicPlaybackControllerTest {
         }
 
         private void completeRead(VoiceClip clip) {
-            clips.complete(clip, new short[] {1, 2, 3});
+            completeRead(clip, new short[] {1, 2, 3});
+        }
+
+        private void completeRead(VoiceClip clip, short[] samples) {
+            clips.complete(clip, samples);
         }
 
         @Override

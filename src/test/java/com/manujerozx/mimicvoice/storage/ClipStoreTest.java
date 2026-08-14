@@ -18,6 +18,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 import org.junit.jupiter.api.Test;
@@ -212,6 +213,133 @@ class ClipStoreTest {
             assertEquals(0, store.clipCount());
             assertNull(store.select(playerId, null));
             assertEquals(0, store.pendingSaveCount());
+        }
+    }
+
+    @Test
+    void clearControlAdmissionRemainsAvailableWhenBulkStorageIsSaturated() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        CountDownLatch firstSaveEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirstSave = new CountDownLatch(1);
+        AtomicBoolean gateEnabled = new AtomicBoolean();
+        AtomicBoolean firstSave = new AtomicBoolean();
+        Runnable saveGate = () -> {
+            if (gateEnabled.get() && firstSave.compareAndSet(false, true)) {
+                firstSaveEntered.countDown();
+                try {
+                    releaseFirstSave.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        PluginSettings settings = settings(new PluginSettings.Storage(
+                false, 200, 72, 64 * 1024L, 64 * 1024L));
+
+        try (ClipStore store = new ClipStore(temporaryDirectory.resolve("saturated-clear"),
+                Logger.getAnonymousLogger(), () -> settings, WavIO::read, saveGate)) {
+            assertTrue(store.saveOwned(playerId, "Player", voiceFrame()));
+            store.awaitIdle().get();
+            assertNotNull(store.select(playerId, null));
+
+            gateEnabled.set(true);
+            assertTrue(store.saveOwned(UUID.randomUUID(), "Blocked", new short[] {1, 2, 3}));
+            assertTrue(firstSaveEntered.await(5, TimeUnit.SECONDS));
+            for (int index = 0; index < ClipStore.MAX_BULK_IO_ADMISSIONS; index++) {
+                store.saveOwned(UUID.randomUUID(), "Bulk" + index, new short[] {1, 2, 3});
+            }
+
+            CompletableFuture<Integer> clear = store.clearAll();
+            assertFalse(clear.isCompletedExceptionally(),
+                    "clear must have a reserved bounded control admission");
+            assertNull(store.select(playerId, null),
+                    "playback selection must remain suppressed until clear completes");
+
+            releaseFirstSave.countDown();
+            assertTrue(clear.get(5, TimeUnit.SECONDS) >= 1);
+            assertEquals(0, store.clipCount());
+        }
+    }
+
+    @Test
+    void storageShutdownReportsNonCooperativeReaderAndBlocksPostCloseMutation() throws Exception {
+        CountDownLatch readEntered = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        ClipStore.WavReader reader = path -> {
+            readEntered.countDown();
+            while (true) {
+                try {
+                    if (releaseRead.await(10, TimeUnit.MILLISECONDS)) {
+                        return new WavIO.WavData(PluginSettings.SAMPLE_RATE, new short[] {1});
+                    }
+                } catch (InterruptedException ignored) {
+                    // Deliberately model a third-party reader that ignores interruption.
+                }
+            }
+        };
+        PluginSettings settings = settings(20);
+
+        try (ClipStore store = new ClipStore(temporaryDirectory.resolve("non-cooperative-storage"),
+                Logger.getAnonymousLogger(), () -> settings, reader, () -> { }, 50L, 50L)) {
+            CompletableFuture<short[]> read = store.read(new VoiceClip(
+                    "blocked", UUID.randomUUID(), "Player",
+                    temporaryDirectory.resolve("blocked.wav"), null, 1,
+                    System.currentTimeMillis()));
+            assertTrue(readEntered.await(5, TimeUnit.SECONDS));
+
+            assertFalse(store.shutdown(),
+                    "shutdown must report that a non-cooperative reader remains live");
+            assertFalse(store.saveOwned(UUID.randomUUID(), "AfterClose", new short[] {1}),
+                    "post-close clip admission must fail closed");
+
+            releaseRead.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!store.storageWorkersStopped() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertTrue(store.storageWorkersStopped());
+            assertNull(read.get(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void storageShutdownDoesNotRegisterAPendingSaveAfterClose() throws Exception {
+        CountDownLatch saveEntered = new CountDownLatch(1);
+        CountDownLatch releaseSave = new CountDownLatch(1);
+        Runnable saveGate = () -> {
+            saveEntered.countDown();
+            while (true) {
+                try {
+                    if (releaseSave.await(10, TimeUnit.MILLISECONDS)) {
+                        return;
+                    }
+                } catch (InterruptedException ignored) {
+                    // Deliberately model a writer that ignores interruption.
+                }
+            }
+        };
+        PluginSettings settings = settings(new PluginSettings.Storage(
+                false, 20, 72, 64 * 1024L, 64 * 1024L));
+        ClipStore store = new ClipStore(temporaryDirectory.resolve("non-cooperative-save"),
+                Logger.getAnonymousLogger(), () -> settings, WavIO::read, saveGate, 50L, 50L);
+        try {
+            assertTrue(store.saveOwned(UUID.randomUUID(), "BeforeClose", new short[] {1, 2, 3}));
+            assertTrue(saveEntered.await(5, TimeUnit.SECONDS));
+            assertFalse(store.shutdown(),
+                    "shutdown must report that a non-cooperative save remains live");
+
+            releaseSave.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!store.storageWorkersStopped() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertTrue(store.storageWorkersStopped());
+            assertEquals(0, store.clipCount(),
+                    "a save that crosses the close boundary must not register a clip");
+            assertEquals(0, store.saveSucceeded());
+        } finally {
+            releaseSave.countDown();
+            store.shutdown();
         }
     }
 

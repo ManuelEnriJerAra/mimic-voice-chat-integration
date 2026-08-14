@@ -18,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,8 +34,11 @@ import com.manujerozx.mimicvoice.audio.WavIO;
 
 public final class ClipStore implements AutoCloseable {
 
-    private static final int MAX_PENDING_SAVES = 256;
+    static final int MAX_PENDING_SAVES = 256;
+    static final int MAX_BULK_IO_ADMISSIONS = MAX_PENDING_SAVES - 1;
     static final int MAX_PENDING_READS = 64;
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS = 10_000L;
+    private static final long DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS = 1_000L;
 
     private final Path root;
     private final Path quarantineRoot;
@@ -44,6 +48,11 @@ public final class ClipStore implements AutoCloseable {
     private final ThreadPoolExecutor readExecutor;
     private final Thread maintenanceThread;
     private final WavReader wavReader;
+    private final Runnable beforeSave;
+    private final Semaphore bulkIoAdmissions = new Semaphore(MAX_BULK_IO_ADMISSIONS);
+    private final Object mutationLock = new Object();
+    private final long shutdownTimeoutMilliseconds;
+    private final long shutdownFollowupMilliseconds;
     private final PendingAudioBudget pendingAudioBudget = new PendingAudioBudget(MAX_PENDING_SAVES);
     private final Set<PendingSave> pendingSaves = ConcurrentHashMap.newKeySet();
     private final AtomicLong rejectedBackpressureCount = new AtomicLong();
@@ -55,24 +64,50 @@ public final class ClipStore implements AutoCloseable {
     private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
     private final Map<String, UUID> playersByName = new ConcurrentHashMap<>();
     private final Set<PendingRead> pendingReads = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean clearAllInProgress =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final Map<UUID, java.util.concurrent.atomic.AtomicInteger> pendingPlayerClears =
+            new ConcurrentHashMap<>();
     private volatile boolean closed;
+    private volatile boolean workersStopped;
 
     public ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings) {
-        this(root, logger, settings, WavIO::read);
+        this(root, logger, settings, WavIO::read, () -> { },
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
     }
 
     ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings, WavReader wavReader) {
+        this(root, logger, settings, wavReader, () -> { },
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings,
+              WavReader wavReader, Runnable beforeSave) {
+        this(root, logger, settings, wavReader, beforeSave,
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings,
+              WavReader wavReader, Runnable beforeSave,
+              long shutdownTimeoutMilliseconds, long shutdownFollowupMilliseconds) {
+        if (shutdownTimeoutMilliseconds < 1L || shutdownFollowupMilliseconds < 1L) {
+            throw new IllegalArgumentException("shutdown timeouts must be positive");
+        }
         this.root = root;
         this.quarantineRoot = root.resolve("_rejected_noise");
         this.logger = logger;
         this.settings = settings;
         this.wavReader = wavReader;
+        this.beforeSave = beforeSave;
+        this.shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
+        this.shutdownFollowupMilliseconds = shutdownFollowupMilliseconds;
         this.ioExecutor = boundedExecutor("mimic-voice-storage", MAX_PENDING_SAVES);
         // The worker itself occupies one slot, so the queue has one fewer
         // entries than the public pending-read bound.
         this.readExecutor = boundedExecutor("mimic-voice-read", MAX_PENDING_READS - 1);
         this.maintenanceThread = Thread.ofPlatform().name("mimic-voice-storage-maintenance")
                 .daemon(true).unstarted(this::runMaintenanceLoop);
+        this.workersStopped = false;
         this.maintenanceThread.start();
     }
 
@@ -84,17 +119,51 @@ public final class ClipStore implements AutoCloseable {
                 new ThreadPoolExecutor.AbortPolicy());
     }
 
-    private <T> CompletableFuture<T> submitIo(java.util.function.Supplier<T> task) {
+    private <T> CompletableFuture<T> submitControlIo(java.util.function.Supplier<T> task) {
         CompletableFuture<T> result = new CompletableFuture<>();
         try {
             ioExecutor.execute(() -> {
                 try {
+                    if (closed) {
+                        result.completeExceptionally(new RejectedExecutionException(
+                                "voice clip storage is closed"));
+                        return;
+                    }
                     result.complete(task.get());
                 } catch (Throwable failure) {
                     result.completeExceptionally(failure);
                 }
             });
         } catch (RejectedExecutionException exception) {
+            result.completeExceptionally(exception);
+        }
+        return result;
+    }
+
+    private <T> CompletableFuture<T> submitBulkIo(java.util.function.Supplier<T> task) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        if (closed || !bulkIoAdmissions.tryAcquire()) {
+            result.completeExceptionally(new RejectedExecutionException(
+                    "voice clip storage bulk work is at capacity"));
+            return result;
+        }
+        try {
+            ioExecutor.execute(() -> {
+                try {
+                    if (closed) {
+                        result.completeExceptionally(new RejectedExecutionException(
+                                "voice clip storage is closed"));
+                        return;
+                    }
+                    result.complete(task.get());
+                } catch (Throwable failure) {
+                    result.completeExceptionally(failure);
+                } finally {
+                    bulkIoAdmissions.release();
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            bulkIoAdmissions.release();
             result.completeExceptionally(exception);
         }
         return result;
@@ -107,9 +176,13 @@ public final class ClipStore implements AutoCloseable {
                 if (closed) {
                     return;
                 }
-                submitIo(() -> {
+                submitBulkIo(() -> {
                     runRetentionMaintenance();
                     return null;
+                }).whenComplete((ignored, failure) -> {
+                    if (failure != null && !closed) {
+                        logger.log(Level.FINE, "Could not queue voice clip retention maintenance", failure);
+                    }
                 });
             }
         } catch (InterruptedException exception) {
@@ -118,7 +191,7 @@ public final class ClipStore implements AutoCloseable {
     }
 
     public CompletableFuture<Integer> initialize() {
-        return submitIo(this::loadPersistedClips);
+        return submitBulkIo(this::loadPersistedClips);
     }
 
     /** Queues a save without blocking and defensively owns caller-provided samples. */
@@ -141,6 +214,12 @@ public final class ClipStore implements AutoCloseable {
             return false;
         }
 
+        if (!bulkIoAdmissions.tryAcquire()) {
+            releaseReservation(bytes);
+            rejectForBackpressure(playerName);
+            return false;
+        }
+
         short[] ownedSamples;
         PendingSave pending = null;
         try {
@@ -151,6 +230,7 @@ public final class ClipStore implements AutoCloseable {
             return true;
         } catch (RejectedExecutionException exception) {
             if (pending == null) {
+                bulkIoAdmissions.release();
                 releaseReservation(bytes);
             } else {
                 pending.cancel();
@@ -160,6 +240,7 @@ public final class ClipStore implements AutoCloseable {
             return false;
         } catch (RuntimeException exception) {
             if (pending == null) {
+                bulkIoAdmissions.release();
                 releaseReservation(bytes);
             } else {
                 pending.cancel();
@@ -172,7 +253,7 @@ public final class ClipStore implements AutoCloseable {
     }
 
     public VoiceClip select(UUID playerId, String previousClipId) {
-        if (playerId == null) {
+        if (playerId == null || clearAllInProgress.get() || pendingPlayerClears.containsKey(playerId)) {
             return null;
         }
         List<VoiceClip> candidates = new ArrayList<>(
@@ -192,11 +273,11 @@ public final class ClipStore implements AutoCloseable {
     }
 
     public CompletableFuture<short[]> read(VoiceClip clip) {
-        if (clip.memoryAudio() != null) {
-            return CompletableFuture.completedFuture(clip.memoryAudio().clone());
-        }
         if (closed) {
             return CompletableFuture.completedFuture(null);
+        }
+        if (clip.memoryAudio() != null) {
+            return CompletableFuture.completedFuture(clip.memoryAudio().clone());
         }
         CompletableFuture<short[]> result = new CompletableFuture<>();
         PendingRead pending = new PendingRead(clip, result);
@@ -211,31 +292,59 @@ public final class ClipStore implements AutoCloseable {
     }
 
     public CompletableFuture<Integer> clearAll() {
-        return submitIo(() -> {
-            int acceptedCount = clipCount();
-            List<VoiceClip> snapshot = allClips();
-            clips.clear();
-            playersByName.clear();
+        if (!clearAllInProgress.compareAndSet(false, true)) {
+            return CompletableFuture.failedFuture(new RejectedExecutionException(
+                    "voice clip clear-all is already pending"));
+        }
+        CompletableFuture<Integer> result = submitControlIo(() -> {
+            int acceptedCount;
+            List<VoiceClip> snapshot;
+            synchronized (mutationLock) {
+                if (closed) {
+                    throw new RejectedExecutionException("voice clip storage is closed");
+                }
+                acceptedCount = clipCount();
+                snapshot = allClips();
+                clips.clear();
+                playersByName.clear();
+            }
             snapshot.forEach(this::deleteFile);
             int quarantinedCount = deleteQuarantinedFiles(null);
             removeEmptyDirectories();
             return acceptedCount + quarantinedCount;
         });
+        result.whenComplete((ignored, failure) -> clearAllInProgress.set(false));
+        return result;
     }
 
     public CompletableFuture<Integer> clearPlayer(UUID playerId) {
-        return submitIo(() -> {
-            List<VoiceClip> removed = clips.remove(playerId);
+        if (playerId == null) {
+            return CompletableFuture.completedFuture(0);
+        }
+        java.util.concurrent.atomic.AtomicInteger pending = pendingPlayerClears.computeIfAbsent(
+                playerId, missing -> new java.util.concurrent.atomic.AtomicInteger());
+        pending.incrementAndGet();
+        CompletableFuture<Integer> result = submitControlIo(() -> {
+            List<VoiceClip> removed;
+            synchronized (mutationLock) {
+                if (closed) {
+                    throw new RejectedExecutionException("voice clip storage is closed");
+                }
+                removed = clips.remove(playerId);
+                playersByName.entrySet().removeIf(entry -> playerId.equals(entry.getValue()));
+            }
             int acceptedCount = 0;
             if (removed != null) {
                 removed.forEach(this::deleteFile);
                 acceptedCount = removed.size();
             }
-            playersByName.entrySet().removeIf(entry -> playerId.equals(entry.getValue()));
             int quarantinedCount = deleteQuarantinedFiles(playerId);
             removeEmptyDirectories();
             return acceptedCount + quarantinedCount;
         });
+        result.whenComplete((completedValue, failure) -> pendingPlayerClears.compute(playerId,
+                (playerKey, count) -> count == null || count.decrementAndGet() <= 0 ? null : count));
+        return result;
     }
 
     public UUID findPlayerId(String playerName) {
@@ -292,10 +401,13 @@ public final class ClipStore implements AutoCloseable {
      * asynchronous storage boundary with playback selection.</p>
      */
     public CompletableFuture<Void> awaitIdle() {
-        return submitIo(() -> null);
+        return submitBulkIo(() -> null);
     }
 
     private int loadPersistedClips() {
+        if (closed) {
+            return 0;
+        }
         try {
             Files.createDirectories(root);
         } catch (IOException exception) {
@@ -303,9 +415,12 @@ public final class ClipStore implements AutoCloseable {
             return 0;
         }
 
+        if (closed) {
+            return 0;
+        }
         long cutoff = retentionCutoff();
         purgeExpiredQuarantinedFiles(cutoff);
-        if (!settings.get().storage().persistClips()) {
+        if (closed || !settings.get().storage().persistClips()) {
             return 0;
         }
         try (Stream<Path> playerDirectories = Files.list(root)) {
@@ -315,11 +430,17 @@ public final class ClipStore implements AutoCloseable {
         } catch (IOException exception) {
             logger.log(Level.WARNING, "Could not scan saved voice clips", exception);
         }
+        if (closed) {
+            return 0;
+        }
         clips.keySet().forEach(this::enforcePlayerLimit);
         return clipCount();
     }
 
     private void loadPlayerDirectory(Path directory, long cutoff) {
+        if (closed) {
+            return;
+        }
         UUID playerId;
         try {
             playerId = UUID.fromString(directory.getFileName().toString());
@@ -337,6 +458,9 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void loadClip(UUID playerId, Path path, long cutoff) {
+        if (closed) {
+            return;
+        }
         String fileName = path.getFileName().toString();
         int separator = fileName.indexOf('_');
         int randomSuffix = fileName.lastIndexOf('_');
@@ -348,31 +472,55 @@ public final class ClipStore implements AutoCloseable {
         try {
             long createdAt = Long.parseLong(fileName.substring(0, separator));
             if (createdAt < cutoff) {
-                Files.deleteIfExists(path);
+                if (!closed) {
+                    Files.deleteIfExists(path);
+                }
                 return;
             }
             String playerName = fileName.substring(separator + 1, randomSuffix);
+            if (closed) {
+                return;
+            }
             WavIO.WavData data = WavIO.read(path);
+            if (closed) {
+                return;
+            }
             if (data.sampleRate() != PluginSettings.SAMPLE_RATE || data.samples().length <= 0) {
                 quarantineInvalidPersistedClip(path, playerId, null);
                 return;
             }
             if (!SpeechQuality.hasEnoughSpeech(
                     data.samples(), settings.get().recording().voiceActivity())) {
-                playersByName.put(playerName.toLowerCase(Locale.ROOT), playerId);
+                synchronized (mutationLock) {
+                    if (closed) {
+                        return;
+                    }
+                    playersByName.put(playerName.toLowerCase(Locale.ROOT), playerId);
+                }
                 quarantine(path, playerId);
                 return;
             }
-            register(new VoiceClip(fileName, playerId, playerName, path, null,
-                    data.samples().length, createdAt));
+            synchronized (mutationLock) {
+                if (closed) {
+                    return;
+                }
+                register(new VoiceClip(fileName, playerId, playerName, path, null,
+                        data.samples().length, createdAt));
+            }
         } catch (IOException | RuntimeException exception) {
             quarantineInvalidPersistedClip(path, playerId, exception);
         }
     }
 
     private short[] readNow(VoiceClip clip) {
+        if (closed) {
+            return null;
+        }
         try {
             WavIO.WavData data = wavReader.read(clip.path());
+            if (closed) {
+                return null;
+            }
             if (data.sampleRate() != PluginSettings.SAMPLE_RATE) {
                 throw new IOException("Unexpected sample rate " + data.sampleRate());
             }
@@ -384,6 +532,9 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void quarantineInvalidPersistedClip(Path path, UUID playerId, Exception failure) {
+        if (closed) {
+            return;
+        }
         try {
             if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
                 quarantine(path, playerId);
@@ -398,21 +549,35 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private boolean saveNow(UUID playerId, String playerName, short[] samples) throws IOException {
+        if (closed) {
+            return false;
+        }
         String safeName = safePlayerName(playerName);
         long createdAt = System.currentTimeMillis();
         String id = createdAt + "_" + safeName + "_" + UUID.randomUUID().toString().substring(0, 8);
         PluginSettings.Storage storage = settings.get().storage();
         if (!storage.persistClips()) {
-            register(new VoiceClip(id, playerId, safeName, null, samples, samples.length, createdAt));
-            enforcePlayerLimit(playerId);
-            enforceMemoryLimit();
+            synchronized (mutationLock) {
+                if (closed) {
+                    return false;
+                }
+                register(new VoiceClip(id, playerId, safeName, null, samples, samples.length, createdAt));
+                enforcePlayerLimit(playerId);
+                enforceMemoryLimit();
+            }
             return true;
         }
 
         Path path = root.resolve(playerId.toString()).resolve(id + ".wav");
         WavIO.write(path, samples, PluginSettings.SAMPLE_RATE);
-        register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
-        enforcePlayerLimit(playerId);
+        synchronized (mutationLock) {
+            if (closed) {
+                Files.deleteIfExists(path);
+                return false;
+            }
+            register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
+            enforcePlayerLimit(playerId);
+        }
         return true;
     }
 
@@ -422,12 +587,18 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void enforcePlayerLimit(UUID playerId) {
+        if (closed) {
+            return;
+        }
         CopyOnWriteArrayList<VoiceClip> playerClips = clips.get(playerId);
         if (playerClips == null) {
             return;
         }
         long cutoff = retentionCutoff();
         for (VoiceClip clip : new ArrayList<>(playerClips)) {
+            if (closed) {
+                return;
+            }
             if (clip.createdAt() < cutoff) {
                 playerClips.remove(clip);
                 deleteFile(clip);
@@ -437,6 +608,9 @@ public final class ClipStore implements AutoCloseable {
         ordered.sort(Comparator.comparingLong(VoiceClip::createdAt).reversed());
         int maximum = settings.get().storage().maximumClipsPerPlayer();
         for (int index = maximum; index < ordered.size(); index++) {
+            if (closed) {
+                return;
+            }
             VoiceClip expired = ordered.get(index);
             playerClips.remove(expired);
             deleteFile(expired);
@@ -444,6 +618,9 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void enforceMemoryLimit() {
+        if (closed) {
+            return;
+        }
         long maximumBytes = settings.get().storage().maximumMemoryAudioBytes();
         List<VoiceClip> memoryClips = allClips().stream()
                 .filter(clip -> clip.memoryAudio() != null)
@@ -453,6 +630,9 @@ public final class ClipStore implements AutoCloseable {
                 .mapToLong(clip -> (long) clip.samples() * Short.BYTES)
                 .sum();
         for (VoiceClip clip : memoryClips) {
+            if (closed) {
+                return;
+            }
             if (totalBytes <= maximumBytes) {
                 break;
             }
@@ -463,17 +643,22 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void invalidateUnreadableClip(VoiceClip clip, Exception failure) {
-        removeActiveClip(clip);
-        Path path = clip.path();
-        if (path != null && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-            try {
-                quarantine(path, clip.speakerId());
-            } catch (IOException quarantineFailure) {
-                logger.log(Level.WARNING, "Could not quarantine unreadable voice clip " + path,
-                        quarantineFailure);
+        synchronized (mutationLock) {
+            if (closed) {
+                return;
             }
+            removeActiveClip(clip);
+            Path path = clip.path();
+            if (path != null && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                try {
+                    quarantine(path, clip.speakerId());
+                } catch (IOException quarantineFailure) {
+                    logger.log(Level.WARNING, "Could not quarantine unreadable voice clip " + path,
+                            quarantineFailure);
+                }
+            }
+            logger.log(Level.WARNING, "Removed unreadable voice clip from playback index " + path, failure);
         }
-        logger.log(Level.WARNING, "Removed unreadable voice clip from playback index " + path, failure);
     }
 
     private boolean removeActiveClip(VoiceClip clip) {
@@ -527,10 +712,15 @@ public final class ClipStore implements AutoCloseable {
         if (clip.path() == null) {
             return;
         }
-        try {
-            Files.deleteIfExists(clip.path());
-        } catch (IOException exception) {
-            logger.log(Level.WARNING, "Could not delete voice clip " + clip.path(), exception);
+        synchronized (mutationLock) {
+            if (closed) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(clip.path());
+            } catch (IOException exception) {
+                logger.log(Level.WARNING, "Could not delete voice clip " + clip.path(), exception);
+            }
         }
     }
 
@@ -618,9 +808,21 @@ public final class ClipStore implements AutoCloseable {
 
     private void runRetentionMaintenance() {
         try {
+            if (closed) {
+                return;
+            }
             clips.keySet().forEach(this::enforcePlayerLimit);
+            if (closed) {
+                return;
+            }
             enforceMemoryLimit();
+            if (closed) {
+                return;
+            }
             purgeExpiredQuarantinedFiles(retentionCutoff());
+            if (closed) {
+                return;
+            }
             removeEmptyDirectories();
         } catch (RuntimeException exception) {
             logger.log(Level.WARNING, "Voice clip retention maintenance failed", exception);
@@ -628,6 +830,9 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private int deleteQuarantinedFiles(UUID playerId) {
+        if (closed) {
+            return 0;
+        }
         if (playerId != null) {
             return deleteQuarantinedDirectory(quarantineRoot.resolve(playerId.toString()));
         }
@@ -638,6 +843,9 @@ public final class ClipStore implements AutoCloseable {
         try (Stream<Path> directories = Files.list(quarantineRoot)) {
             for (Path directory : directories
                     .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                if (closed) {
+                    break;
+                }
                 deleted += deleteQuarantinedDirectory(directory);
             }
         } catch (IOException exception) {
@@ -656,6 +864,9 @@ public final class ClipStore implements AutoCloseable {
             for (Path path : files
                     .filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
                     .filter(file -> file.getFileName().toString().endsWith(".wav")).toList()) {
+                if (closed) {
+                    break;
+                }
                 try {
                     if (Files.deleteIfExists(path)) {
                         deleted++;
@@ -672,6 +883,9 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void deleteDirectoryIfEmpty(Path directory) {
+        if (closed) {
+            return;
+        }
         try (Stream<Path> contents = Files.list(directory)) {
             if (contents.findAny().isEmpty()) {
                 Files.deleteIfExists(directory);
@@ -682,11 +896,14 @@ public final class ClipStore implements AutoCloseable {
     }
 
     private void removeEmptyDirectories() {
-        if (!Files.isDirectory(root)) {
+        if (closed || !Files.isDirectory(root)) {
             return;
         }
         try (Stream<Path> directories = Files.list(root)) {
             directories.filter(Files::isDirectory).forEach(directory -> {
+                if (closed) {
+                    return;
+                }
                 try (Stream<Path> contents = Files.list(directory)) {
                     if (contents.findAny().isEmpty()) {
                         Files.deleteIfExists(directory);
@@ -722,7 +939,8 @@ public final class ClipStore implements AutoCloseable {
         @Override
         public void run() {
             try {
-                if (saveNow(playerId, playerName, samples)) {
+                beforeSave.run();
+                if (!closed && saveNow(playerId, playerName, samples)) {
                     successfulSaveCount.incrementAndGet();
                 }
             } catch (IOException | RuntimeException exception) {
@@ -741,6 +959,7 @@ public final class ClipStore implements AutoCloseable {
         private void complete() {
             if (completed.compareAndSet(false, true)) {
                 pendingSaves.remove(this);
+                bulkIoAdmissions.release();
                 releaseReservation(bytes);
             }
         }
@@ -759,7 +978,8 @@ public final class ClipStore implements AutoCloseable {
         @Override
         public void run() {
             try {
-                result.complete(readNow(clip));
+                short[] samples = closed ? null : readNow(clip);
+                result.complete(closed ? null : samples);
             } finally {
                 complete();
             }
@@ -779,29 +999,70 @@ public final class ClipStore implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
+        shutdown();
+    }
+
+    /**
+     * Closes storage and returns whether every storage worker reached a terminal state.
+     * A non-terminal result is fail-closed: running tasks cannot register clips or
+     * invalidate the active index after the close boundary.
+     */
+    public boolean shutdown() {
+        synchronized (mutationLock) {
+            closed = true;
+        }
         maintenanceThread.interrupt();
         readExecutor.shutdown();
         ioExecutor.shutdown();
+        boolean readStopped = true;
+        boolean ioStopped = true;
         try {
-            maintenanceThread.join(1_000L);
-            if (!readExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
-                logger.warning("Voice clip reads did not finish before shutdown.");
-                readExecutor.shutdownNow();
-                pendingReads.forEach(PendingRead::cancel);
-            }
-            if (!ioExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
-                logger.warning("Voice clip storage did not finish all pending work before shutdown.");
-                ioExecutor.shutdownNow();
-                pendingSaves.forEach(PendingSave::cancel);
-            }
+            maintenanceThread.join(shutdownTimeoutMilliseconds);
+            readStopped = awaitExecutor(readExecutor, "Voice clip reads", pendingReads,
+                    shutdownTimeoutMilliseconds, shutdownFollowupMilliseconds);
+            ioStopped = awaitExecutor(ioExecutor, "Voice clip storage", pendingSaves,
+                    shutdownTimeoutMilliseconds, shutdownFollowupMilliseconds);
         } catch (InterruptedException exception) {
             readExecutor.shutdownNow();
             ioExecutor.shutdownNow();
             pendingReads.forEach(PendingRead::cancel);
             pendingSaves.forEach(PendingSave::cancel);
+            readStopped = false;
+            ioStopped = false;
             Thread.currentThread().interrupt();
         }
+        workersStopped = !maintenanceThread.isAlive() && readStopped && ioStopped
+                && readExecutor.isTerminated() && ioExecutor.isTerminated();
+        if (!workersStopped) {
+            logger.severe("Voice clip storage shutdown did not reach a terminal worker state; "
+                    + "post-close clip registration and index mutation are disabled.");
+        }
+        return workersStopped;
+    }
+
+    boolean storageWorkersStopped() {
+        return workersStopped || (!maintenanceThread.isAlive()
+                && readExecutor.isTerminated() && ioExecutor.isTerminated());
+    }
+
+    private boolean awaitExecutor(ThreadPoolExecutor executor, String description,
+                                      Set<?> pending, long timeoutMilliseconds,
+                                      long followupMilliseconds) throws InterruptedException {
+        if (executor.awaitTermination(timeoutMilliseconds, TimeUnit.MILLISECONDS)) {
+            return true;
+        }
+        logger.warning(description + " did not finish before shutdown; cancelling queued work.");
+        executor.shutdownNow();
+        if (pending != null) {
+            pending.forEach(item -> {
+                if (item instanceof PendingRead read) {
+                    read.cancel();
+                } else if (item instanceof PendingSave save) {
+                    save.cancel();
+                }
+            });
+        }
+        return executor.awaitTermination(followupMilliseconds, TimeUnit.MILLISECONDS);
     }
 
     @FunctionalInterface

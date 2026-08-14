@@ -128,14 +128,17 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
             playbackManager.close();
         }
         if (recordingManager != null) {
-            recordingManager.close();
-            if (!recordingManager.workerStopped()) {
-                getLogger().severe("Voice capture worker did not terminate before storage shutdown; "
-                        + "the installed Opus implementation ignored cancellation.");
+            if (!recordingManager.shutdown()) {
+                getLogger().severe("Voice capture shutdown did not reach a terminal worker state; "
+                        + "capture is fail-closed and storage admission is disabled while the installed "
+                        + "Opus implementation remains live.");
             }
         }
         if (clipStore != null) {
-            clipStore.close();
+            if (!clipStore.shutdown()) {
+                getLogger().severe("Voice clip storage shutdown did not reach a terminal worker state; "
+                        + "post-close clip registration and index mutation are disabled.");
+            }
         }
         if (consentRegistry != null) {
             consentRegistry.close();
@@ -253,15 +256,25 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
                 + clipStore.saveRejectedBackpressure()
                 + "; pending playback reads: " + clipStore.pendingReadCount()
                 + "; playback reads rejected by backpressure: " + clipStore.readRejectedBackpressure()
-                + "; memory audio: " + clipStore.memoryAudioBytes() + " bytes.",
+                + "; memory audio: " + clipStore.memoryAudioBytes() + " bytes; active playback PCM: "
+                + playbackManager.activePlaybackPcmBytes() + " bytes; playback PCM rejections: "
+                + playbackManager.playbackPcmRejections() + ".",
                 NamedTextColor.GRAY));
     }
 
     private void clearClips(CommandSender sender, String target) {
         if (target.equalsIgnoreCase("all")) {
             playbackManager.clearAll();
-            clipStore.clearAll().thenAccept(count -> sendAsync(sender,
-                    "Removed " + count + " Mimic voice clip(s)."));
+            clipStore.clearAll().whenComplete((count, failure) -> {
+                if (failure != null) {
+                    getLogger().log(java.util.logging.Level.WARNING,
+                            "Could not clear all Mimic voice clips", failure);
+                    sendAsync(sender, "Could not clear Mimic voice clips; no deletion was confirmed.",
+                            NamedTextColor.RED);
+                } else {
+                    sendAsync(sender, "Removed " + count + " Mimic voice clip(s).");
+                }
+            });
             return;
         }
 
@@ -277,14 +290,26 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
         }
         UUID resolvedId = playerId;
         playbackManager.clearPlayer(resolvedId);
-        clipStore.clearPlayer(resolvedId).thenAccept(count -> sendAsync(sender,
-                "Removed " + count + " Mimic voice clip(s) for " + target + "."));
+        clipStore.clearPlayer(resolvedId).whenComplete((count, failure) -> {
+            if (failure != null) {
+                getLogger().log(java.util.logging.Level.WARNING,
+                        "Could not clear Mimic voice clips for " + target, failure);
+                sendAsync(sender, "Could not clear Mimic voice clips for " + target
+                        + "; no deletion was confirmed.", NamedTextColor.RED);
+            } else {
+                sendAsync(sender, "Removed " + count + " Mimic voice clip(s) for " + target + ".");
+            }
+        });
     }
 
     private void sendAsync(CommandSender sender, String message) {
+        sendAsync(sender, message, NamedTextColor.GREEN);
+    }
+
+    private void sendAsync(CommandSender sender, String message, NamedTextColor color) {
         if (isEnabled()) {
             Bukkit.getScheduler().runTask(this,
-                    () -> sender.sendMessage(Component.text(message, NamedTextColor.GREEN)));
+                    () -> sender.sendMessage(Component.text(message, color)));
         }
     }
 

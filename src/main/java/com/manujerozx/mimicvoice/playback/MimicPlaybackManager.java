@@ -108,6 +108,14 @@ public final class MimicPlaybackManager implements AutoCloseable {
         return controller.startedPlaybacks();
     }
 
+    public long activePlaybackPcmBytes() {
+        return controller.activePlaybackPcmBytes();
+    }
+
+    public long playbackPcmRejections() {
+        return controller.playbackPcmRejections();
+    }
+
     private void tick() {
         VoicechatServerApi api = apiSupplier.get();
         if (!settings.get().playback().enabled() || api == null) {

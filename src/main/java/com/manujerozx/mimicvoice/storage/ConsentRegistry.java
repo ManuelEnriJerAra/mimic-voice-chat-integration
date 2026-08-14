@@ -32,6 +32,8 @@ import org.bukkit.configuration.file.YamlConfiguration;
 public final class ConsentRegistry implements AutoCloseable {
 
     private static final long SHUTDOWN_TIMEOUT_MILLISECONDS = 5_000L;
+    static final int MAX_PENDING_RESULTS = 256;
+    static final int MAX_INITIAL_LOAD_OVERRIDES = 256;
 
     private final File file;
     private final Logger logger;
@@ -42,6 +44,7 @@ public final class ConsentRegistry implements AutoCloseable {
     private final List<CompletableFuture<Boolean>> pendingResults = new ArrayList<>();
     private volatile Set<UUID> optedOut = Set.of();
     private Set<UUID> pendingSnapshot;
+    private boolean initialLoadOverrideOverflow;
     private boolean closed;
     private final CompletableFuture<Boolean> initialized = new CompletableFuture<>();
 
@@ -77,6 +80,7 @@ public final class ConsentRegistry implements AutoCloseable {
             return CompletableFuture.completedFuture(false);
         }
         CompletableFuture<Boolean> persisted = new CompletableFuture<>();
+        boolean acceptedForDurability = true;
         synchronized (monitor) {
             if (closed) {
                 persisted.complete(false);
@@ -89,10 +93,24 @@ public final class ConsentRegistry implements AutoCloseable {
                 updated.add(playerId);
             }
             optedOut = Set.copyOf(updated);
-            overrides.put(playerId, allowed);
+            if (!initialized.isDone()
+                    && !overrides.containsKey(playerId)
+                    && overrides.size() >= MAX_INITIAL_LOAD_OVERRIDES) {
+                initialLoadOverrideOverflow = true;
+                acceptedForDurability = false;
+            } else if (!initialized.isDone()) {
+                overrides.put(playerId, allowed);
+            }
             pendingSnapshot = optedOut;
-            pendingResults.add(persisted);
+            if (pendingResults.size() < MAX_PENDING_RESULTS) {
+                pendingResults.add(persisted);
+            } else {
+                acceptedForDurability = false;
+            }
             monitor.notifyAll();
+        }
+        if (!acceptedForDurability) {
+            persisted.complete(false);
         }
         return persisted;
     }
@@ -122,7 +140,8 @@ public final class ConsentRegistry implements AutoCloseable {
             if (pendingSnapshot != null) {
                 pendingSnapshot = optedOut;
             }
-            initialized.complete(loadSucceeded);
+            overrides.clear();
+            initialized.complete(loadSucceeded && !initialLoadOverrideOverflow);
             monitor.notifyAll();
         }
 
@@ -170,6 +189,18 @@ public final class ConsentRegistry implements AutoCloseable {
 
     private void complete(List<CompletableFuture<Boolean>> results, boolean saved) {
         results.forEach(result -> result.complete(saved));
+    }
+
+    int pendingResultCount() {
+        synchronized (monitor) {
+            return pendingResults.size();
+        }
+    }
+
+    int pendingInitialOverrideCount() {
+        synchronized (monitor) {
+            return overrides.size();
+        }
     }
 
     @Override

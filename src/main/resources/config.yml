@@ -47,6 +47,8 @@ playback:
   minimum-clip-seconds: 1.0
   minimum-nearby-listeners: 1
   # Playback is always restricted to the player whose appearance the Mimic copied.
+  # Active PCM passed to voice players is capped globally; excess playbacks retry later.
+  maximum-active-audio-megabytes: 128
 
   # Every Mimic independently chooses random clips at random times.
   first-delay-seconds:

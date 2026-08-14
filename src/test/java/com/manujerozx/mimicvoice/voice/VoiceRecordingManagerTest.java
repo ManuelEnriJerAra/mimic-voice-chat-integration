@@ -335,6 +335,36 @@ class VoiceRecordingManagerTest {
     }
 
     @Test
+    void nonCooperativeDecoderShutdownFailsClosedAndBlocksPostShutdownSaves() throws Exception {
+        FakeDecoder decoder = new FakeDecoder();
+        decoder.gatePayload(1);
+        decoder.ignoreInterruptions();
+        decoder.output = ignored -> speechFrame(8_000);
+        AtomicInteger saveCount = new AtomicInteger();
+        try (Harness harness = new Harness(4, () -> decoder,
+                (id, name, samples) -> {
+                    saveCount.incrementAndGet();
+                    return true;
+                }, 50L, 50L)) {
+            send(harness, 1);
+            assertTrue(decoder.decodeEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+            assertFalse(harness.manager.shutdown(),
+                    "shutdown must expose a live non-cooperative decoder");
+            assertEquals(0, saveCount.get(),
+                    "fail-closed capture must not admit clips after shutdown begins");
+
+            decoder.releaseGate();
+            long deadline = System.nanoTime() + TEST_TIMEOUT.toNanos();
+            while (harness.manager.workerAlive() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertFalse(harness.manager.workerAlive());
+            assertEquals(0, saveCount.get());
+        }
+    }
+
+    @Test
     void fatalWorkerFailureDropsQueuedPacketsBeforeTerminating() throws Exception {
         FakeDecoder decoder = new FakeDecoder();
         decoder.gatePayload(1);
@@ -480,6 +510,12 @@ class VoiceRecordingManagerTest {
 
         private Harness(int queueCapacity, Supplier<FakeDecoder> decoderSupplier,
                         VoiceRecordingManager.ClipSaver clipSaver) {
+            this(queueCapacity, decoderSupplier, clipSaver, 10_000L, 1_000L);
+        }
+
+        private Harness(int queueCapacity, Supplier<FakeDecoder> decoderSupplier,
+                        VoiceRecordingManager.ClipSaver clipSaver,
+                        long shutdownTimeoutMilliseconds, long shutdownFollowupMilliseconds) {
             Logger logger = Logger.getAnonymousLogger();
             logger.setLevel(Level.OFF);
             consent = new ConsentRegistry(Path.of(System.getProperty("java.io.tmpdir"),
@@ -490,7 +526,8 @@ class VoiceRecordingManagerTest {
                         FakeDecoder decoder = decoderSupplier.get();
                         decoders.add(decoder);
                         return decoder.asDecoder();
-                    }, consent, ignored -> true, playerSnapshots, queueCapacity);
+                    }, consent, ignored -> true, playerSnapshots, queueCapacity,
+                    shutdownTimeoutMilliseconds, shutdownFollowupMilliseconds);
         }
 
         private List<Integer> decodedPayloads() {
@@ -517,6 +554,7 @@ class VoiceRecordingManagerTest {
         private volatile Integer gatedPayload;
         private volatile IntFunction<short[]> output = ignored -> new short[0];
         private volatile String decodeThread;
+        private volatile boolean ignoreInterruptions;
 
         private OpusDecoder asDecoder() {
             return (OpusDecoder) Proxy.newProxyInstance(
@@ -532,6 +570,10 @@ class VoiceRecordingManagerTest {
             releaseGate.countDown();
         }
 
+        private void ignoreInterruptions() {
+            ignoreInterruptions = true;
+        }
+
         private Object invokeDecode(byte[] encoded) {
             int payload = encoded == null || encoded.length == 0 ? -1 : encoded[0] & 0xff;
             payloads.add(payload);
@@ -541,7 +583,19 @@ class VoiceRecordingManagerTest {
             try {
                 if (gatedPayload != null && gatedPayload == payload) {
                     decodeEntered.countDown();
-                    releaseGate.await();
+                    if (ignoreInterruptions) {
+                        while (true) {
+                            try {
+                                if (releaseGate.await(10, TimeUnit.MILLISECONDS)) {
+                                    break;
+                                }
+                            } catch (InterruptedException ignored) {
+                                // Deliberately model a decoder that ignores interruption.
+                            }
+                        }
+                    } else {
+                        releaseGate.await();
+                    }
                 }
                 return output.apply(payload);
             } catch (InterruptedException exception) {

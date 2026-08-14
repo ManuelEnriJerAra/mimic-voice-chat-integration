@@ -10,6 +10,7 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
     public static final long BYTES_PER_MEBIBYTE = 1_048_576L;
     public static final long DEFAULT_MAXIMUM_PENDING_WRITE_BYTES = 64L * BYTES_PER_MEBIBYTE;
     public static final long DEFAULT_MAXIMUM_MEMORY_AUDIO_BYTES = 512L * BYTES_PER_MEBIBYTE;
+    public static final long DEFAULT_MAXIMUM_ACTIVE_AUDIO_BYTES = 128L * BYTES_PER_MEBIBYTE;
 
     public static PluginSettings from(FileConfiguration config) {
         String configuredPermission = config.getString("recording.permission", "mimicvoice.record");
@@ -54,7 +55,9 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
                 firstMaximum,
                 repeatMinimum,
                 repeatMaximum,
-                clamp(config.getInt("playback.retry-without-clip-seconds", 10), 1, 600));
+                clamp(config.getInt("playback.retry-without-clip-seconds", 10), 1, 600),
+                mebibytes(config.getLong("playback.maximum-active-audio-megabytes", 128L),
+                        1L, 8_192L));
         return new PluginSettings(recording, storage, playback);
     }
 
@@ -116,7 +119,19 @@ public record PluginSettings(Recording recording, Storage storage, Playback play
     public record Playback(boolean enabled, float distance, double volume, double minimumClipSeconds,
                            int minimumNearbyListeners, int firstMinimumSeconds,
                            int firstMaximumSeconds, int repeatMinimumSeconds,
-                           int repeatMaximumSeconds, int retryWithoutClipSeconds) {
+                           int repeatMaximumSeconds, int retryWithoutClipSeconds,
+                           long maximumActiveAudioBytes) {
+
+        /** Backward-compatible constructor for component tests and integrations. */
+        public Playback(boolean enabled, float distance, double volume, double minimumClipSeconds,
+                        int minimumNearbyListeners, int firstMinimumSeconds,
+                        int firstMaximumSeconds, int repeatMinimumSeconds,
+                        int repeatMaximumSeconds, int retryWithoutClipSeconds) {
+            this(enabled, distance, volume, minimumClipSeconds, minimumNearbyListeners,
+                    firstMinimumSeconds, firstMaximumSeconds, repeatMinimumSeconds,
+                    repeatMaximumSeconds, retryWithoutClipSeconds,
+                    DEFAULT_MAXIMUM_ACTIVE_AUDIO_BYTES);
+        }
     }
 
     private static long mebibytes(long value, long minimum, long maximum) {

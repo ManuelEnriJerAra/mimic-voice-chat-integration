@@ -108,9 +108,13 @@ loading; during that period no loaded clips are available for selection.
 `onDisable()` first makes the voice-chat addon inert and unregisters its volume
 category, then stops playback and closes recording sessions. The recording
 worker drains the already accepted bounded packet queue in FIFO order, flushes
-active sessions, closes their Opus decoders, and terminates before storage is
-closed. New packets are rejected once shutdown begins. Consent, bounded playback
-reads, and bounded storage work are then closed on their respective workers.
+active sessions, closes their Opus decoders, and is joined before storage is
+closed. New packets and post-shutdown clip admission are rejected once shutdown
+begins. If a third-party decoder ignores both `close()` and interruption, the
+plugin reports a failed, fail-closed capture shutdown rather than claiming a
+terminal worker state. Consent, bounded playback reads, and bounded storage work
+are then closed on their respective workers; storage similarly reports a
+non-terminal worker instead of permitting post-close index mutation.
 
 ### Join and quit behavior
 
@@ -348,9 +352,10 @@ memory-only PCM pool; the oldest memory clips are evicted when it is exceeded.
 Storage file work is isolated from the Bukkit main thread. A single bounded
 storage worker serializes file writes, startup scanning, deletions, quarantine
 moves, and retention passes; a separate single bounded read worker handles disk
-playback reads. The storage work queue is bounded, and playback admission is
-bounded at 64 pending reads. Completed PCM save submissions are bounded by both
-256 pending entries and
+playback reads. Bulk storage work uses a reserved bounded admission slot for
+clear/control operations, so a saturated save queue cannot silently displace a
+privacy deletion. Playback admission is bounded at 64 pending reads. Completed
+PCM save submissions are bounded by both 256 pending entries and
 `storage.maximum-pending-write-megabytes` (64 MiB by default). Admission is
 non-blocking: a clip that would exceed either bound is rejected and counted as a
 backpressure rejection. The PCM array returned by the segmenter is transferred
@@ -515,7 +520,7 @@ start, so it cannot play after the entity changes to another identity.
 
 | Command | Who can use it | Behavior |
 | --- | --- | --- |
-| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending-write count/bytes, pending playback reads, successful/failed saves, save/read backpressure rejections, and memory-audio bytes |
+| `/mimicvoice status` | `mimicvoice.admin` | Reports API readiness, clip/player counts, active captures, tracked Mimics, active/total playbacks, queue depth/capacity, received/processed packets, overload drops, accepted segments, pending-write count/bytes, pending playback reads, successful/failed saves, save/read backpressure rejections, memory-audio bytes, active playback PCM bytes, and playback PCM budget rejections |
 | `/mimicvoice reload` | `mimicvoice.admin` | Reloads `config.yml`, flushes or discards capture sessions depending on the new recording setting, and resets playback states |
 | `/mimicvoice clear <player>` | `mimicvoice.admin` | Removes accepted and quarantined clips for an online name or a name known by the clip index |
 | `/mimicvoice clear all` | `mimicvoice.admin` | Removes all indexed accepted clips and all quarantined WAV files |
@@ -528,9 +533,11 @@ The command alias is `/mvc`. `mimicvoice.admin` defaults to operators, while
 
 The clear operations are asynchronous because file deletion runs on the storage
 executor. Playback state is invalidated immediately on the Bukkit thread before
-deletion is queued; the confirmation message is sent back on the Bukkit thread
-after the operation completes. A capture already in progress may still produce
-a later clip unless recording is denied or disabled.
+deletion is queued, and playback selection for the affected scope is suppressed
+until the clear future completes. The confirmation or explicit failure message
+is sent back on the Bukkit thread after the operation completes. A capture
+already in progress may still produce a later clip unless recording is denied or
+disabled; a failed clear never claims that deletion was confirmed.
 
 ## 12. Configuration reference
 
@@ -590,9 +597,12 @@ zero frames.
 | `playback.repeat-delay-seconds.minimum` | `5` | `1` to `3600` |
 | `playback.repeat-delay-seconds.maximum` | `20` | At least the repeat minimum, at most `3600` |
 | `playback.retry-without-clip-seconds` | `10` | `1` to `600` |
+| `playback.maximum-active-audio-megabytes` | `128` | `1` to `8192` MiB of active playback PCM |
 
 The first delay may be configured as zero. Repeat delay is always at least one
-second after clamping.
+second after clamping. Active PCM passed to Simple Voice Chat players is also
+bounded globally by `playback.maximum-active-audio-megabytes`; playbacks that
+would exceed the budget are rejected non-blockingly and retried later.
 
 ## 13. Threading and shutdown model
 
@@ -626,14 +636,17 @@ discard controls invalidate queued work; a finish control flushes only work
 already processed into the active session.
 
 On plugin shutdown, no new packets are accepted. The capture worker drains its
-accepted queue, flushes active sessions, closes decoders, and is joined for up
-to ten seconds (with a final interrupt/warning fallback that clears queued work).
-Bounded read and storage workers are then closed with their own completion
-windows.
+accepted queue, flushes active sessions, closes decoders, and is joined for up to
+ten seconds (with a final cancellation/interrupt fallback that clears queued
+work). If it remains live because a third-party decoder is non-cooperative,
+shutdown is reported as failed and publication stays disabled. Bounded read and
+storage workers are then closed with their own completion windows and a second
+terminal check; a failed check is logged explicitly and post-close
+registration/index mutation remains disabled.
 
 ## 14. Automated tests
 
-The current test suite contains 76 passing tests:
+The current test suite contains 82 passing tests:
 
 - `WavIOTest` verifies 48 kHz mono PCM write/read round-tripping and temporary
   file cleanup after a successful write.
@@ -645,12 +658,14 @@ The current test suite contains 76 passing tests:
   oldest-clip eviction, quarantine of persisted sparse noise, quarantine
   retention, offline quarantined-name indexing, accepted/quarantined clear
   behavior, bounded pending-write accounting, failed-save cleanup, FIFO clear
-  ordering, global memory-only eviction, defensive caller-array ownership,
-  bounded disk-read admission, and corrupt playback-file quarantine.
+  ordering, saturated clear/control admission, global memory-only eviction,
+  defensive caller-array ownership, bounded disk-read admission, corrupt
+  playback-file quarantine, and non-cooperative storage shutdown.
 - `PendingAudioBudgetTest` verifies non-blocking admission against both the
   pending-entry and pending-byte limits.
 - `ConsentRegistryTest` verifies durable opt-out/opt-in round-trips, temporary
-  file cleanup, and explicit persistence-failure reporting.
+  file cleanup, explicit persistence-failure reporting, and bounded retention
+  when persistence is blocked.
 - `MimicVoicechatAddonTest` verifies shutdown makes the addon inert and removes
   its registered volume category, and verifies microphone admission uses the
   immutable UUID/snapshot boundary without Bukkit `Player` access.
@@ -665,15 +680,16 @@ The current test suite contains 76 passing tests:
   delay boundaries, listener gating, no-clip retry, identity/load generation
   invalidation, removal/reload/API/setting shutdown, clear invalidation and
   active-stop behavior, channel-follow updates, gain clamping, alternate-clip
-  selection, cleanup after a throwing stop, idempotent close, and main-thread
-  dispatch of storage completions.
+  selection, cleanup after a throwing stop, active-playback PCM admission/release,
+  idempotent close, and main-thread dispatch of storage completions.
 - `MimicVoicePipelineComponentTest` combines the real voice activity segmenter,
   asynchronous `ClipStore` save/index, UUID-targeted selection, and the
   playback request sink. It is a component test, not a live Paper or UDP test.
 - `VoiceRecordingManagerTest` verifies callback offload, per-player FIFO order,
   single-decoder serialization, bounded overflow recovery, consent-denial and
   finish/quit barriers, reload invalidation, normal accepted capture, idempotent
-  worker shutdown, atomic generation/save admission, fatal-queue cleanup,
+  worker shutdown including fail-closed non-cooperative decoder handling, atomic
+  generation/save admission, fatal-queue cleanup,
   separate speech-acceptance/submission-failure counters, and a 2,000-packet
   bounded-queue stress path.
 

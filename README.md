@@ -86,6 +86,14 @@ clips are evicted when that cap is reached. Disk playback reads use a separate
 fixed 64-read queue; excess reads are rejected for a later playback retry rather
 than accumulating in an unbounded executor.
 
+Clear operations retain a reserved bounded control admission, so a saturated save
+queue cannot silently displace privacy deletion. Playback selection for the
+affected scope is suppressed until the asynchronous clear succeeds or fails;
+failure is reported explicitly and is never presented as confirmed deletion.
+Active playback PCM is also capped globally by
+`playback.maximum-active-audio-megabytes` (128 MiB by default); excess playbacks
+retry later without blocking the Bukkit thread.
+
 By default, each Mimic chooses another random clip after a random 5–20 second
 delay measured from the end of its previous clip. Playback uses a locational
 channel that follows the carrier, which remains compatible with LibsDisguises.
@@ -115,7 +123,8 @@ quarantined clips can be removed with the admin clear command.
 received and processed packet counts, overload drops, accepted speech segments,
 pending storage writes and their PCM byte total, successful/failed storage
 saves, save/read backpressure rejections, pending playback reads, and current
-memory-audio bytes. If recording or storage is overloaded, the plugin drops
+memory-audio bytes, active playback PCM bytes, and playback PCM budget
+rejections. If recording or storage is overloaded, the plugin drops
 recording work without interrupting normal voice transmission; storage admission
 never blocks the capture worker.
 

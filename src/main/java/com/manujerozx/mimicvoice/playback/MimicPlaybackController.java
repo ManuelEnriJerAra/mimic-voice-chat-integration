@@ -36,6 +36,8 @@ final class MimicPlaybackController implements AutoCloseable {
     private final Map<UUID, Target> currentTargets = new HashMap<>();
     private boolean closed;
     private long startedPlaybacks;
+    private long activePlaybackPcmBytes;
+    private long playbackPcmRejections;
 
     MimicPlaybackController(Supplier<PluginSettings> settings,
                             ClipSource clips,
@@ -142,10 +144,12 @@ final class MimicPlaybackController implements AutoCloseable {
             return;
         }
         State state = states.get(entityId);
-        if (state == null || state.playback != handle) {
+        if (state == null || state.playback == null || state.playback.handle != handle) {
             return;
         }
+        PlaybackLease lease = state.playback;
         state.playback = null;
+        releasePlaybackPcm(lease.pcmBytes);
         PluginSettings.Playback playbackSettings = settings.get().playback();
         state.identity.setNextPlaybackAt(clock.nowMillis()
                 + delays.nextDelayMillis(playbackSettings.repeatMinimumSeconds(),
@@ -162,6 +166,14 @@ final class MimicPlaybackController implements AutoCloseable {
 
     long startedPlaybacks() {
         return startedPlaybacks;
+    }
+
+    long activePlaybackPcmBytes() {
+        return activePlaybackPcmBytes;
+    }
+
+    long playbackPcmRejections() {
+        return playbackPcmRejections;
     }
 
     long nextPlaybackAt(UUID entityId) {
@@ -206,7 +218,7 @@ final class MimicPlaybackController implements AutoCloseable {
         if (state.identity.loading() || state.playback != null
                 || now < state.identity.nextPlaybackAt()) {
             if (state.playback != null) {
-                state.playback.update(target);
+                state.playback.handle.update(target);
             }
             return;
         }
@@ -265,20 +277,29 @@ final class MimicPlaybackController implements AutoCloseable {
             return;
         }
 
+        long pcmBytes = (long) samples.length * Short.BYTES;
+        if (!reservePlaybackPcm(pcmBytes, playbackSettings.maximumActiveAudioBytes())) {
+            playbackPcmRejections++;
+            scheduleRetry(state, playbackSettings, clock.nowMillis());
+            return;
+        }
+
         PlaybackHandle handle;
         try {
             handle = playbackSink.start(target, clip, samples, playbackSettings.volume(),
                     playback -> dispatchPlaybackStopped(entityId, state, playback));
         } catch (RuntimeException exception) {
+            releasePlaybackPcm(pcmBytes);
             scheduleRetry(state, playbackSettings, clock.nowMillis());
             return;
         }
         if (handle == null) {
+            releasePlaybackPcm(pcmBytes);
             scheduleRetry(state, playbackSettings, clock.nowMillis());
             return;
         }
 
-        state.playback = handle;
+        state.playback = new PlaybackLease(handle, pcmBytes);
         state.identity.setLastClipId(clip.id());
         startedPlaybacks++;
     }
@@ -286,7 +307,8 @@ final class MimicPlaybackController implements AutoCloseable {
     private void dispatchPlaybackStopped(UUID entityId, State state, PlaybackHandle handle) {
         try {
             mainThread.execute(() -> {
-                if (states.get(entityId) == state && state.playback == handle) {
+                if (states.get(entityId) == state && state.playback != null
+                        && state.playback.handle == handle) {
                     playbackStopped(entityId, handle);
                 }
             });
@@ -315,14 +337,28 @@ final class MimicPlaybackController implements AutoCloseable {
 
     private void stop(State state) {
         if (state.playback != null) {
-            PlaybackHandle playback = state.playback;
+            PlaybackLease lease = state.playback;
             state.playback = null;
+            releasePlaybackPcm(lease.pcmBytes);
             try {
-                playback.stop();
+                lease.handle.stop();
             } catch (RuntimeException exception) {
                 reportFailure(exception);
             }
         }
+    }
+
+    private boolean reservePlaybackPcm(long pcmBytes, long maximumBytes) {
+        if (pcmBytes <= 0 || maximumBytes <= 0 || pcmBytes > maximumBytes
+                || activePlaybackPcmBytes > maximumBytes - pcmBytes) {
+            return false;
+        }
+        activePlaybackPcmBytes += pcmBytes;
+        return true;
+    }
+
+    private void releasePlaybackPcm(long pcmBytes) {
+        activePlaybackPcmBytes = Math.max(0L, activePlaybackPcmBytes - pcmBytes);
     }
 
     private void invalidateForClear(State state, long now) {
@@ -404,6 +440,16 @@ final class MimicPlaybackController implements AutoCloseable {
 
     private static final class State {
         private final MimicIdentityTracker identity = new MimicIdentityTracker();
-        private PlaybackHandle playback;
+        private PlaybackLease playback;
+    }
+
+    private static final class PlaybackLease {
+        private final PlaybackHandle handle;
+        private final long pcmBytes;
+
+        private PlaybackLease(PlaybackHandle handle, long pcmBytes) {
+            this.handle = handle;
+            this.pcmBytes = pcmBytes;
+        }
     }
 }

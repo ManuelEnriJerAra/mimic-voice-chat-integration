@@ -30,6 +30,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
     private static final long SESSION_EXPIRY_MILLISECONDS = 60_000L;
     private static final long WORKER_POLL_MILLISECONDS = 100L;
     private static final long SHUTDOWN_TIMEOUT_MILLISECONDS = 10_000L;
+    private static final long SHUTDOWN_FOLLOWUP_MILLISECONDS = 1_000L;
 
     private final Logger logger;
     private final Supplier<PluginSettings> settings;
@@ -44,6 +45,8 @@ public final class VoiceRecordingManager implements AutoCloseable {
     private final int queueCapacity;
     private final Thread worker;
     private final Object lifecycle = new Object();
+    private final long shutdownTimeoutMilliseconds;
+    private final long shutdownFollowupMilliseconds;
     private final AtomicLong nextStateId = new AtomicLong();
     private final AtomicLong receivedPackets = new AtomicLong();
     private final AtomicLong processedPackets = new AtomicLong();
@@ -68,8 +71,22 @@ public final class VoiceRecordingManager implements AutoCloseable {
                           ConsentRegistry consentRegistry, Predicate<UUID> captureAllowed,
                           PlayerSnapshotCache playerSnapshots,
                           int queueCapacity) {
+        this(logger, settings, clipSaver, decoderFactory, consentRegistry, captureAllowed,
+                playerSnapshots, queueCapacity, SHUTDOWN_TIMEOUT_MILLISECONDS,
+                SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    VoiceRecordingManager(Logger logger, Supplier<PluginSettings> settings,
+                          ClipSaver clipSaver, DecoderFactory decoderFactory,
+                          ConsentRegistry consentRegistry, Predicate<UUID> captureAllowed,
+                          PlayerSnapshotCache playerSnapshots,
+                          int queueCapacity, long shutdownTimeoutMilliseconds,
+                          long shutdownFollowupMilliseconds) {
         if (queueCapacity < 1) {
             throw new IllegalArgumentException("queueCapacity must be positive");
+        }
+        if (shutdownTimeoutMilliseconds < 1L || shutdownFollowupMilliseconds < 1L) {
+            throw new IllegalArgumentException("shutdown timeouts must be positive");
         }
         this.logger = logger;
         this.settings = settings;
@@ -79,6 +96,8 @@ public final class VoiceRecordingManager implements AutoCloseable {
         this.captureAllowed = captureAllowed;
         this.playerSnapshots = playerSnapshots;
         this.queueCapacity = queueCapacity;
+        this.shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
+        this.shutdownFollowupMilliseconds = shutdownFollowupMilliseconds;
         this.workQueue = new ArrayBlockingQueue<>(queueCapacity);
         this.worker = Thread.ofPlatform().name("mimic-voice-capture-worker").daemon(true).unstarted(
                 this::runWorker);
@@ -334,6 +353,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
     }
 
     private void processPacket(PacketWork work) {
+        if (closed) {
+            return;
+        }
         processedPackets.incrementAndGet();
         PlayerState state = states.get(work.playerId());
         if (state == null || state.stateId != work.stateId()) {
@@ -492,8 +514,8 @@ public final class VoiceRecordingManager implements AutoCloseable {
          * filesystem I/O here.
          */
         synchronized (state.lock) {
-            if (state.generation != generation
-                    && (allowedGeneration < 0 || state.generation != allowedGeneration)) {
+            if (closed || (state.generation != generation
+                    && (allowedGeneration < 0 || state.generation != allowedGeneration))) {
                 return;
             }
             acceptedSegments.incrementAndGet();
@@ -529,6 +551,15 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     @Override
     public void close() {
+        shutdown();
+    }
+
+    /**
+     * Requests terminal capture shutdown and reports whether the worker stopped.
+     * A false result is fail-closed: packet admission and clip publication remain
+     * disabled even if a third-party decoder ignores cancellation.
+     */
+    public boolean shutdown() {
         synchronized (lifecycle) {
             if (!closed) {
                 closed = true;
@@ -537,24 +568,32 @@ public final class VoiceRecordingManager implements AutoCloseable {
             }
         }
         if (Thread.currentThread() == worker) {
-            return;
+            return !worker.isAlive();
         }
+        boolean stopped = false;
         try {
-            worker.join(SHUTDOWN_TIMEOUT_MILLISECONDS);
+            worker.join(shutdownTimeoutMilliseconds);
+            stopped = !worker.isAlive();
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         }
-        if (worker.isAlive()) {
+        if (!stopped && worker.isAlive()) {
             clearQueuedWork();
             closeActiveDecoders();
             logger.warning("Voice capture worker did not stop within the shutdown timeout; clearing queued work, closing decoders, and interrupting it.");
             worker.interrupt();
             try {
-                worker.join(1_000L);
+                worker.join(shutdownFollowupMilliseconds);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
             }
+            stopped = !worker.isAlive();
         }
+        if (!stopped) {
+            logger.severe("Voice capture shutdown did not reach a terminal worker state; "
+                    + "capture is fail-closed and no further clip admission will occur.");
+        }
+        return stopped;
     }
 
     /**
