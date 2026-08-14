@@ -278,11 +278,10 @@ public final class MimicSimpleVoiceChatIntegration extends JavaPlugin implements
             return;
         }
 
-        UUID playerId = clipStore.findPlayerId(target);
         Player online = Bukkit.getPlayerExact(target);
-        if (playerId == null && online != null) {
-            playerId = online.getUniqueId();
-        }
+        UUID playerId = online != null
+                ? online.getUniqueId()
+                : clipStore.findPlayerId(target);
         if (playerId == null) {
             sender.sendMessage(Component.text("No saved clips were found for " + target + ".",
                     NamedTextColor.YELLOW));

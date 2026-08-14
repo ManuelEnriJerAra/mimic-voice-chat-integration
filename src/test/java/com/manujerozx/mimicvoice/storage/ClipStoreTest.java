@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
@@ -50,6 +52,28 @@ class ClipStoreTest {
             assertEquals("Player_Name", selected.speakerName());
             assertNull(store.select(UUID.randomUUID(), null),
                     "A Mimic must not fall back to another player's clips");
+        }
+    }
+
+    @Test
+    void legacyNameIndexIsUnresolvedWhenNameBelongsToMultiplePlayers() throws Exception {
+        UUID firstPlayer = UUID.randomUUID();
+        UUID secondPlayer = UUID.randomUUID();
+        PluginSettings settings = settings(new PluginSettings.Storage(
+                false, 20, 72, 64 * 1024L, 64 * 1024L));
+
+        try (ClipStore store = new ClipStore(temporaryDirectory.resolve("ambiguous-name"),
+                Logger.getAnonymousLogger(), () -> settings)) {
+            assertTrue(store.saveOwned(firstPlayer, "ReusedName", voiceFrame()));
+            assertTrue(store.saveOwned(secondPlayer, "ReusedName", voiceFrame()));
+            store.awaitIdle().get();
+
+            assertNull(store.findPlayerId("ReusedName"),
+                    "a reused legacy name must not choose either UUID offline");
+
+            assertEquals(1, store.clearPlayer(firstPlayer).get());
+            assertEquals(secondPlayer, store.findPlayerId("ReusedName"),
+                    "removing one owner should leave a unique legacy-name owner");
         }
     }
 
@@ -127,6 +151,36 @@ class ClipStoreTest {
             assertEquals(2, store.clearPlayer(playerId).get());
             assertFalse(Files.exists(accepted));
             assertFalse(Files.exists(quarantined));
+        }
+    }
+
+    @Test
+    void clearReportsAcceptedAndQuarantinedDeletionFailures() throws Exception {
+        UUID playerId = UUID.randomUUID();
+        Path root = temporaryDirectory.resolve("clear-delete-failure");
+        Path accepted = root.resolve(playerId.toString()).resolve(
+                System.currentTimeMillis() + "_Player_accepted.wav");
+        Path quarantined = root.resolve("_rejected_noise").resolve(playerId.toString())
+                .resolve("rejected.wav");
+        WavIO.write(accepted, voiceFrame(), PluginSettings.SAMPLE_RATE);
+        WavIO.write(quarantined, voiceFrame(), PluginSettings.SAMPLE_RATE);
+
+        try (ClipStore store = new ClipStore(root, Logger.getAnonymousLogger(), () -> settings(20))) {
+            assertEquals(1, store.initialize().get());
+
+            Files.delete(accepted);
+            Files.createDirectory(accepted);
+            Files.writeString(accepted.resolve("retained-child"), "not removable as a file");
+            Files.delete(quarantined);
+            Files.createDirectory(quarantined);
+            Files.writeString(quarantined.resolve("retained-child"), "not removable as a file");
+
+            assertThrows(ExecutionException.class, () -> store.clearPlayer(playerId).get(),
+                    "clear must fail visibly when accepted or quarantined data remains");
+            assertTrue(Files.exists(accepted));
+            assertTrue(Files.exists(quarantined));
+            assertNotNull(store.select(playerId, null),
+                    "an undeleted accepted clip must remain available for retry");
         }
     }
 

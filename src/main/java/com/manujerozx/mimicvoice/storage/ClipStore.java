@@ -1,6 +1,7 @@
 package com.manujerozx.mimicvoice.storage;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -62,7 +63,12 @@ public final class ClipStore implements AutoCloseable {
     private final AtomicLong rejectedReadCount = new AtomicLong();
     private final AtomicLong lastReadBackpressureLogAt = new AtomicLong();
     private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
-    private final Map<String, UUID> playersByName = new ConcurrentHashMap<>();
+    /**
+     * A legacy player name is only a safe offline lookup when it maps to one
+     * UUID.  Keep every observed owner so name reuse becomes unresolved rather
+     * than silently selecting the last clip registered.
+     */
+    private final Map<String, Set<UUID>> playersByName = new ConcurrentHashMap<>();
     private final Set<PendingRead> pendingReads = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicBoolean clearAllInProgress =
             new java.util.concurrent.atomic.AtomicBoolean();
@@ -297,21 +303,25 @@ public final class ClipStore implements AutoCloseable {
                     "voice clip clear-all is already pending"));
         }
         CompletableFuture<Integer> result = submitControlIo(() -> {
-            int acceptedCount;
             List<VoiceClip> snapshot;
+            List<VoiceClip> deleted = new ArrayList<>();
+            DeletionFailures failures = new DeletionFailures();
             synchronized (mutationLock) {
                 if (closed) {
                     throw new RejectedExecutionException("voice clip storage is closed");
                 }
-                acceptedCount = clipCount();
                 snapshot = allClips();
+                snapshot.forEach(clip -> deleteFileForClear(clip, deleted, failures));
+                int quarantinedCount = deleteQuarantinedFilesForClear(null, failures);
+                removeEmptyDirectoriesForClear(failures);
+                if (failures.hasFailure()) {
+                    deleted.forEach(this::removeActiveClip);
+                    failures.throwIfPresent();
+                }
                 clips.clear();
                 playersByName.clear();
+                return snapshot.size() + quarantinedCount;
             }
-            snapshot.forEach(this::deleteFile);
-            int quarantinedCount = deleteQuarantinedFiles(null);
-            removeEmptyDirectories();
-            return acceptedCount + quarantinedCount;
         });
         result.whenComplete((ignored, failure) -> clearAllInProgress.set(false));
         return result;
@@ -325,30 +335,49 @@ public final class ClipStore implements AutoCloseable {
                 playerId, missing -> new java.util.concurrent.atomic.AtomicInteger());
         pending.incrementAndGet();
         CompletableFuture<Integer> result = submitControlIo(() -> {
-            List<VoiceClip> removed;
+            List<VoiceClip> candidates;
+            List<VoiceClip> deleted = new ArrayList<>();
+            DeletionFailures failures = new DeletionFailures();
             synchronized (mutationLock) {
                 if (closed) {
                     throw new RejectedExecutionException("voice clip storage is closed");
                 }
-                removed = clips.remove(playerId);
-                playersByName.entrySet().removeIf(entry -> playerId.equals(entry.getValue()));
+                candidates = new ArrayList<>(clips.getOrDefault(playerId,
+                        new CopyOnWriteArrayList<>()));
+                candidates.forEach(clip -> deleteFileForClear(clip, deleted, failures));
+                int quarantinedCount = deleteQuarantinedFilesForClear(playerId, failures);
+                removeEmptyDirectoriesForClear(failures);
+                if (failures.hasFailure()) {
+                    deleted.forEach(this::removeActiveClip);
+                    failures.throwIfPresent();
+                }
+                clips.remove(playerId);
+                unindexPlayer(playerId);
+                return candidates.size() + quarantinedCount;
             }
-            int acceptedCount = 0;
-            if (removed != null) {
-                removed.forEach(this::deleteFile);
-                acceptedCount = removed.size();
-            }
-            int quarantinedCount = deleteQuarantinedFiles(playerId);
-            removeEmptyDirectories();
-            return acceptedCount + quarantinedCount;
         });
         result.whenComplete((completedValue, failure) -> pendingPlayerClears.compute(playerId,
                 (playerKey, count) -> count == null || count.decrementAndGet() <= 0 ? null : count));
         return result;
     }
 
+    /**
+     * Resolves a legacy name only when the persisted index has one owner.
+     * Reused names are deliberately unresolved to avoid cross-player playback
+     * or deletion.
+     */
     public UUID findPlayerId(String playerName) {
-        return playerName == null ? null : playersByName.get(playerName.toLowerCase(Locale.ROOT));
+        String normalized = normalizePlayerName(playerName);
+        if (normalized == null) {
+            return null;
+        }
+        synchronized (mutationLock) {
+            Set<UUID> owners = playersByName.get(normalized);
+            if (owners == null || owners.size() != 1) {
+                return null;
+            }
+            return owners.iterator().next();
+        }
     }
 
     public int clipCount() {
@@ -495,7 +524,7 @@ public final class ClipStore implements AutoCloseable {
                     if (closed) {
                         return;
                     }
-                    playersByName.put(playerName.toLowerCase(Locale.ROOT), playerId);
+                    indexPlayerName(playerName, playerId);
                 }
                 quarantine(path, playerId);
                 return;
@@ -583,7 +612,7 @@ public final class ClipStore implements AutoCloseable {
 
     private void register(VoiceClip clip) {
         clips.computeIfAbsent(clip.speakerId(), ignored -> new CopyOnWriteArrayList<>()).add(clip);
-        playersByName.put(clip.speakerName().toLowerCase(Locale.ROOT), clip.speakerId());
+        indexPlayerName(clip.speakerName(), clip.speakerId());
     }
 
     private void enforcePlayerLimit(UUID playerId) {
@@ -724,6 +753,30 @@ public final class ClipStore implements AutoCloseable {
         }
     }
 
+    /**
+     * Deletes a clip as part of an explicit privacy clear. Retention
+     * maintenance remains best effort, but a user-requested clear must fail
+     * visibly when its path cannot be removed.
+     */
+    private void deleteFileForClear(VoiceClip clip, List<VoiceClip> deleted,
+                                    DeletionFailures failures) {
+        if (clip.path() == null) {
+            deleted.add(clip);
+            return;
+        }
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        try {
+            Files.deleteIfExists(clip.path());
+            deleted.add(clip);
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not delete voice clip " + clip.path(), exception);
+        }
+    }
+
     private void quarantine(Path path, UUID playerId) throws IOException {
         Path quarantineDirectory = quarantineRoot.resolve(playerId.toString());
         Files.createDirectories(quarantineDirectory);
@@ -799,11 +852,40 @@ public final class ClipStore implements AutoCloseable {
             Long.parseLong(stem.substring(0, timestampSeparator));
             String playerName = stem.substring(timestampSeparator + 1, suffixSeparator);
             if (!playerName.isBlank()) {
-                playersByName.put(playerName.toLowerCase(Locale.ROOT), playerId);
+                indexPlayerName(playerName, playerId);
             }
         } catch (NumberFormatException ignored) {
             // Files without the plugin's normal naming scheme cannot be indexed by name.
         }
+    }
+
+    private void indexPlayerName(String playerName, UUID playerId) {
+        String normalized = normalizePlayerName(playerName);
+        if (normalized == null || playerId == null) {
+            return;
+        }
+        synchronized (mutationLock) {
+            playersByName.computeIfAbsent(normalized,
+                    ignored -> ConcurrentHashMap.newKeySet()).add(playerId);
+        }
+    }
+
+    private void unindexPlayer(UUID playerId) {
+        if (playerId == null) {
+            return;
+        }
+        playersByName.entrySet().removeIf(entry -> {
+            Set<UUID> owners = entry.getValue();
+            owners.remove(playerId);
+            return owners.isEmpty();
+        });
+    }
+
+    private static String normalizePlayerName(String playerName) {
+        if (playerName == null || playerName.isBlank()) {
+            return null;
+        }
+        return playerName.toLowerCase(Locale.ROOT);
     }
 
     private void runRetentionMaintenance() {
@@ -855,6 +937,31 @@ public final class ClipStore implements AutoCloseable {
         return deleted;
     }
 
+    private int deleteQuarantinedFilesForClear(UUID playerId, DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return 0;
+        }
+        if (playerId != null) {
+            return deleteQuarantinedDirectoryForClear(
+                    quarantineRoot.resolve(playerId.toString()), failures);
+        }
+        if (!Files.isDirectory(quarantineRoot, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> directories = Files.list(quarantineRoot)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                deleted += deleteQuarantinedDirectoryForClear(directory, failures);
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+        }
+        deleteDirectoryIfEmptyForClear(quarantineRoot, failures);
+        return deleted;
+    }
+
     private int deleteQuarantinedDirectory(Path directory) {
         if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
             return 0;
@@ -882,6 +989,36 @@ public final class ClipStore implements AutoCloseable {
         return deleted;
     }
 
+    private int deleteQuarantinedDirectoryForClear(Path directory, DeletionFailures failures) {
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path path : files
+                    .filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                    .filter(file -> file.getFileName().toString().endsWith(".wav")).toList()) {
+                if (closed) {
+                    failures.add(new IOException("voice clip storage closed during clear"));
+                    break;
+                }
+                try {
+                    if (Files.deleteIfExists(path)) {
+                        deleted++;
+                    }
+                } catch (IOException exception) {
+                    failures.add(exception);
+                    logger.log(Level.WARNING,
+                            "Could not delete quarantined voice clip " + path, exception);
+                }
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+        }
+        deleteDirectoryIfEmptyForClear(directory, failures);
+        return deleted;
+    }
+
     private void deleteDirectoryIfEmpty(Path directory) {
         if (closed) {
             return;
@@ -892,6 +1029,24 @@ public final class ClipStore implements AutoCloseable {
             }
         } catch (IOException ignored) {
             // A failed cleanup does not affect the clip index.
+        }
+    }
+
+    private void deleteDirectoryIfEmptyForClear(Path directory, DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        try (Stream<Path> contents = Files.list(directory)) {
+            if (contents.findAny().isEmpty()) {
+                Files.deleteIfExists(directory);
+            } else {
+                failures.add(new IOException("voice clip clear left data in " + directory));
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not remove empty voice clip directory " + directory,
+                    exception);
         }
     }
 
@@ -917,9 +1072,53 @@ public final class ClipStore implements AutoCloseable {
         }
     }
 
+    private void removeEmptyDirectoriesForClear(DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> directories = Files.list(root)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                // The clip paths and targeted quarantine directory already
+                // report deletion failures. Other player directories may
+                // legitimately remain populated during clearPlayer().
+                deleteDirectoryIfEmpty(directory);
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not scan voice clip directories during clear", exception);
+        }
+    }
+
     private static String safePlayerName(String playerName) {
         String safe = playerName == null ? "unknown" : playerName.replaceAll("[^A-Za-z0-9_]", "_");
         return safe.isBlank() ? "unknown" : safe.substring(0, Math.min(32, safe.length()));
+    }
+
+    private static final class DeletionFailures {
+        private IOException failure;
+
+        private void add(IOException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        }
+
+        private boolean hasFailure() {
+            return failure != null;
+        }
+
+        private void throwIfPresent() {
+            if (failure != null) {
+                throw new UncheckedIOException(failure);
+            }
+        }
     }
 
     private final class PendingSave implements Runnable {

@@ -1,40 +1,57 @@
-# Independent review remediation
+# Independent Review Remediation
 
-This file records the reproduction and disposition of the findings in the
-independent review. The review artifacts remain outside this repository and were
-not modified.
+This file maps every Critical, High, and Medium finding from the independent review to its reproduction, disposition, fix, and regression coverage. The independent review artifacts remain unchanged in the sibling review directory.
 
-## Critical findings
+## Current remediation
 
-No Critical findings were reported by the independent review.
+### `IDENTITY-001` — ambiguous persisted legacy names
 
-## High and Medium findings
+- Reproduction: two memory-only clips for different UUIDs with the same `ReusedName` made the old last-writer-wins `Map<String, UUID>` return the most recently registered UUID for offline resolution.
+- Root cause: the persisted name index stored only one UUID and overwrote earlier owners.
+- Fix: `ClipStore` now stores a UUID set per normalized name and `findPlayerId()` returns a UUID only for a unique owner. The clear command checks an exact online player before consulting the offline index.
+- Regression tests: `ClipStoreTest.legacyNameIndexIsUnresolvedWhenNameBelongsToMultiplePlayers`, `MimicIdentityResolverTest.exactOnlineLegacyNameBeatsConflictingPersistedIndex`.
+- Status: **resolved**; valid UUID markers remain authoritative and name-only Mimics remain backward compatible when the name is unique.
 
-| ID | Reproduction | Fix | Regression test | Status |
-| --- | --- | --- | --- | --- |
-| VOICE-001 | A blocking `ClipSaver` was paused after the old generation check. A concurrent `discard` returned before the saver was released, proving the old check/save window was not atomic. | `VoiceRecordingManager.publishSegment` now performs the generation check and bounded save admission under the per-player state lock. `ClipStore` only accepts/clones/enqueues there; filesystem storage remains asynchronous and outside the lock. Controls cannot pass the generation boundary while admission is in progress. | `VoiceRecordingManagerTest.generationCheckAndClipAdmissionAreAtomicAgainstDiscard` | Fixed |
-| THREAD-001 | The old constructor called `YamlConfiguration.loadConfiguration` synchronously and consent commands synchronously performed directory creation, write, move, and cleanup. A blocking injected persistence adapter reproduced the command-path wait. | Consent loading and persistence now run on a dedicated daemon worker. In-memory UUID policy changes are immediate; immutable snapshots are coalesced, and returned futures report durability failures. Capture remains paused until initial consent loading succeeds. Failure warnings are dispatched back to Bukkit. | `ConsentRegistryTest.consentChangeDoesNotWaitForBlockingPersistence`, plus file round-trip/failure tests | Fixed |
-| THREAD-002 | The old SVC callback obtained a Bukkit `Player` and queried `getUniqueId`, `hasPermission`, and `getName` on the SVC packet thread. | The addon now uses only SVC sender UUID metadata. Bukkit name/permission values are sampled on the Bukkit main thread into `PlayerSnapshotCache`; packet admission performs only a concurrent cache lookup. | `MimicVoicechatAddonTest.microphoneCallbackUsesVoicechatUuidAndDoesNotTouchBukkitPlayer`; recording callback tests use UUID/snapshot input | Fixed |
-| STORAGE-001 | A controller read was completed, clear was logically executed before the queued main-thread completion, and the old controller still started playback. An already active handle was also not stopped. | `clearPlayer`/`clearAll` invalidate the matching/global controller identity versions, clear last-clip assumptions, schedule retry, and stop active playback before storage deletion is queued. | `MimicPlaybackControllerTest.clearPlayerInvalidatesInFlightReadAndStopsActivePlayback` | Fixed |
-| QUEUE-001 | The old scheduled executor accepted unbounded read/control work. A blocked reader plus more requests than the bound showed no admission rejection. | Immediate storage work uses a bounded executor queue. Disk reads use a separate bounded worker with a 64-read admission bound, retry-visible rejection metric, and no unbounded `CompletableFuture` executor backlog. Clear/control work is separated from bulk reads. | `ClipStoreTest.diskPlaybackReadsHaveASeparateBoundedAdmissionQueue` | Fixed |
-| LIFE-001 | Reproduced the non-cooperative decoder case: a decoder that ignores `close()` and interruption remains live beyond the bounded shutdown wait. | Shutdown now clears queued work, marks the manager closed before cancellation, prevents post-close segment publication, attempts decoder close/interruption, and returns/logs a fail-closed non-terminal result when the worker is still alive. | `VoiceRecordingManagerTest.nonCooperativeDecoderShutdownFailsClosedAndBlocksPostShutdownSaves`; `VoiceRecordingManagerTest.fatalWorkerFailureDropsQueuedPacketsBeforeTerminating` | Remediated with an explicit non-terminal result; Java cannot force-kill a third-party decoder safely, so a decoder that ignores both cancellation mechanisms remains an operational limitation |
-| LIFE-002 | Reproduced that `ClipStore.shutdown()` could return after its first wait while a non-cooperative read/save task was still running, and that post-close work could mutate storage/index state. | Storage shutdown now has a bounded follow-up wait, reports whether all workers terminated, and all save/read/index mutation paths check the closed boundary. A non-terminal result is logged visibly and the integration reports it on disable. | `ClipStoreTest.storageShutdownReportsNonCooperativeReaderAndBlocksPostCloseMutation`; `ClipStoreTest.storageShutdownDoesNotRegisterAPendingSaveAfterClose` | Fixed with fail-closed status; non-cooperative external file I/O can still keep a daemon worker alive until it exits |
-| CONSENT-001 | Reproduced unbounded blocked-persistence growth: 10,000 blocked result futures and 10,001 initial-load overrides accumulated before the fix. | Pending consent result futures and pre-load overrides are bounded at 256 each. Overflow fails closed (`false`), in-memory denial remains immediate, and persistence/load failure remains visible to callers. | `ConsentRegistryTest.blockedPersistenceRetainsOnlyBoundedWaitersAndClearsLoadOverrides` | Fixed |
-| CLEAR-001 | Reproduced a full storage queue rejecting `clearAll()` before the queued save work was released, leaving deletion unconfirmed and old clips selectable. | Bulk storage admissions leave a reserved control slot for clear operations. Clear-all/per-player selection is suppressed while deletion is pending, and asynchronous command completion now reports failure explicitly instead of silently claiming success. | `ClipStoreTest.clearControlAdmissionRemainsAvailableWhenBulkStorageIsSaturated`; integration clear completion path reviewed | Fixed |
-| MEM-001 | Reproduced the absence of an aggregate playback PCM bound: multiple Mimics could each hand a full clip to SVC concurrently without a global reservation. | Playback reserves PCM bytes on the Bukkit-controlled state boundary before starting SVC playback, releases them on every stop/failure/completion path, and retries rejected reads. The cap is configurable and exposed in status. | `MimicPlaybackControllerTest.activePlaybackPcmBudgetRejectsExcessAndReleasesOnStop` | Fixed |
-| PLAY-001 | A throwing playback handle stop aborted the old cleanup path; failed audio-player start left the local player without cleanup. | Controller cleanup now nulls state then catches/reports each handle failure and continues. The manager wraps player callback/start setup and calls `stopPlaying()` on a partially created player when setup/start fails, rethrowing the original failure for controller retry. | `MimicPlaybackControllerTest.playbackStopFailureDoesNotAbortStateCleanup`; source path audited for failed-start cleanup | Fixed |
+### `PRIVACY-001` — clear falsely confirmed after deletion failure
 
-## Low findings and deferred scope
+- Reproduction: replacing an accepted clip and quarantined clip with non-empty directories caused the old `clearPlayer()` future to complete successfully while paths remained.
+- Root cause: ordinary deletion helpers logged `IOException` and returned normally; clear removed index state before deletion and treated the count as confirmation.
+- Fix: explicit clear paths now collect and propagate accepted-file, quarantined-file, and targeted cleanup failures through the future. Successfully deleted active clips are removed; failed active entries and name metadata remain available for retry. The command's asynchronous failure message remains on the Bukkit thread.
+- Regression test: `ClipStoreTest.clearReportsAcceptedAndQuarantinedDeletionFailures` asserts an exceptional future, retained paths, and retained retryable playback state.
+- Status: **resolved**; deletion failures are visible and never presented as confirmed privacy deletion.
 
-| ID | Disposition |
-| --- | --- |
-| STATE-001 | Reproduced: UUID tombstones remain in `VoiceRecordingManager.states`. This was not part of the requested Critical/High/Medium remediation scope. It remains a low-severity bounded-state follow-up because expiration must preserve the quit/late-packet barrier. |
-| PERF-001 | Reproduced by inspection: listener counting is `O(E + M*P)` per playback scan. No behavior-changing spatial-index refactor was included in this release-candidate remediation. |
-| REL-001 | Reproduced: the repository has no `RELEASE_NOTES_V1.0.1.md` and remains version `1.0.0`. Release provenance is intentionally deferred because this task must not release or claim certification. |
+### `CAPTURE-001` — shutdown dropped accepted work
 
-## Validation notes
+- Reproduction: a gated decoder accepted two packets; shutdown began while the first decode was blocked. The old implementation set `closed` before draining, processed only one packet, emptied the queue, and rejected the active-session flush.
+- Root cause: `closed` combined the no-new-admission boundary with the worker's drain/publish state, and normal shutdown interrupted the worker immediately.
+- Fix: `shutdownRequested` now closes packet/control admission while `closed` remains false during normal worker drain. The worker processes accepted FIFO work, flushes active sessions, then sets terminal `closed`. Normal shutdown no longer interrupts a decoder; the bounded timeout fallback still closes/interrupts non-cooperative decoders, marks the manager fail-closed, and clears work that could not be drained.
+- Regression test: `VoiceRecordingManagerTest.normalShutdownDrainsAcceptedPacketsAndFlushesActiveSession` verifies accepted packets drain, active output is flushed, and a late packet is rejected.
+- Status: **resolved** for the normal graceful path; non-cooperative external decoder termination remains bounded and visibly fail-closed as documented.
 
-The final validation record, candidate JAR digest, branch, HEAD, and working-tree
-status are reported in the remediation handoff after the clean verify/package
-run. A fresh independent audit is still required; this file does not certify a
-release.
+## Prior High and Medium findings revalidated
+
+These findings were already remediated before this change. They were rechecked against the current tree and their regression tests still pass.
+
+| ID | Reproduction/disposition | Current regression coverage | Status |
+|---|---|---|---|
+| `VOICE-001` | The stale-generation save race is not reproducible because generation validation and bounded clip admission share the state lock. | `VoiceRecordingManagerTest.generationCheckAndClipAdmissionAreAtomicAgainstDiscard` | Resolved |
+| `THREAD-001` | Consent persistence remains off Bukkit and blocked persistence does not block the decision path. | `ConsentRegistryTest.consentChangeDoesNotWaitForBlockingPersistence`, `blockedPersistenceRetainsOnlyBoundedWaitersAndClearsLoadOverrides` | Resolved |
+| `THREAD-002` | The microphone callback uses SVC UUID/packet data and does not access Bukkit `Player`. | `MimicVoicechatAddonTest.microphoneCallbackUsesVoicechatUuidAndDoesNotTouchBukkitPlayer` | Resolved |
+| `STORAGE-001` | Clear invalidates playback before deletion and late disk-read completions fail identity/version validation. | `MimicPlaybackControllerTest.clearPlayerInvalidatesInFlightReadAndStopsActivePlayback`, `identityChangeInvalidatesInFlightRead` | Resolved |
+| `QUEUE-001` | Capture, storage writes, and disk reads retain fixed or byte-bounded admission. | `ClipStoreTest.diskPlaybackReadsHaveASeparateBoundedAdmissionQueue`, `VoiceRecordingManagerTest.queueOverflowIsNonBlockingAndInvalidatesTheDecoderSession` | Resolved |
+| `LIFE-001` | A non-cooperative decoder still cannot be force-killed safely, but shutdown has bounded waits, visible failure, and fail-closed publication/admission. | `VoiceRecordingManagerTest.nonCooperativeDecoderShutdownFailsClosedAndBlocksPostShutdownSaves` | Mitigated with documented limitation |
+| `LIFE-002` | A non-cooperative storage task can outlive the deadline, but post-close registration/index mutation is blocked and shutdown reports non-terminal state. | `ClipStoreTest.storageShutdownReportsNonCooperativeReaderAndBlocksPostCloseMutation`, `storageShutdownDoesNotRegisterAPendingSaveAfterClose` | Mitigated with documented limitation |
+| `CONSENT-001` | Consent waiters and initial-load overrides are bounded and overflow is visible. | `ConsentRegistryTest.blockedPersistenceRetainsOnlyBoundedWaitersAndClearsLoadOverrides` | Resolved |
+| `CLEAR-001` | Reserved bounded control admission protects clear requests under bulk saturation; exceptional futures are reported. | `ClipStoreTest.clearControlAdmissionRemainsAvailableWhenBulkStorageIsSaturated` | Resolved; deletion I/O is covered separately by `PRIVACY-001` |
+| `MEM-001` | Active playback PCM is globally budgeted and released on stop/completion/failure. | `MimicPlaybackControllerTest.activePlaybackPcmBudgetRejectsExcessAndReleasesOnStop` | Resolved |
+| `PLAY-001` | Playback state cleanup survives stop exceptions; the pinned SVC player stop path flushes/cleans its player thread. | `MimicPlaybackControllerTest.playbackStopFailureDoesNotAbortStateCleanup` | Resolved |
+
+No Critical finding was present in the independent review. The Low follow-ups (`STATE-001`, `PERF-001`, and `REL-001`) remain non-blocking and are documented in the independent report.
+
+## Validation
+
+- `mvn -B -ntp clean verify` — passed; 86 tests, 0 failures/errors/skips.
+- `mvn -B -ntp package` — passed; 86 tests, 0 failures/errors/skips.
+- Candidate JAR inspection found 71 entries, no bundled server/test APIs, and the expected plugin resources.
+- Candidate JAR SHA-256: `E57B6DEF28DCF8E3310981C6ACEC36F9504B12227A3BF19490B583E5159230BA`.
+- A fresh self-review checked callback/thread ownership, bounded queues, UUID/name fallback, clear failure propagation, shutdown state transitions, documentation, CI, and package contents.

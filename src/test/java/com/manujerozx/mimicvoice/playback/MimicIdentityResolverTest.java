@@ -50,6 +50,17 @@ class MimicIdentityResolverTest {
     }
 
     @Test
+    void exactOnlineLegacyNameBeatsConflictingPersistedIndex() {
+        MimicIdentityResolver.Resolution resolution = resolve(
+                new MimicIdentityResolver.Markers(null, "ReusedName", null),
+                name -> name.equals("ReusedName") ? UUID_A : null,
+                ignored -> UUID_B);
+
+        assertEquals(UUID_A, resolution.playerId());
+        assertEquals(MimicIdentityResolver.Source.ONLINE_LEGACY_NAME, resolution.source());
+    }
+
+    @Test
     void missingUuidUsesPersistedNameIndexWhenPlayerIsOffline() {
         MimicIdentityResolver.Resolution resolution = resolve(
                 new MimicIdentityResolver.Markers(null, "OfflineAlice", null),

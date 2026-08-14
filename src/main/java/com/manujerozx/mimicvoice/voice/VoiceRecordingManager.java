@@ -122,7 +122,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     private void enqueueMicrophonePacket(VoicechatApi api, UUID playerId, byte[] opusData,
                                          boolean whispering) {
-        if (closed || capturePaused) {
+        if (closed || shutdownRequested || capturePaused) {
             return;
         }
         PlayerSnapshotCache.Snapshot player = playerSnapshots.get(playerId);
@@ -146,7 +146,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
                 ignored -> new PlayerState(playerId, nextStateId.incrementAndGet()));
         long generation;
         synchronized (state.lock) {
-            if (closed || capturePaused || !state.accepting) {
+            if (closed || shutdownRequested || capturePaused || !state.accepting) {
                 return;
             }
             // Serialize the final eligibility decision with consent/permission
@@ -167,12 +167,19 @@ public final class VoiceRecordingManager implements AutoCloseable {
         // The event/packet object is owned by Simple Voice Chat. Retain only this copy
         // because the worker may run after the event callback has returned.
         byte[] ownedOpusData = opusData.clone();
-        receivedPackets.incrementAndGet();
         PacketWork work = new PacketWork(api, playerId, state.stateId, generation,
                 safePlayerName(player.playerName()), whispering, ownedOpusData,
                 System.currentTimeMillis());
-        if (closed || !workQueue.offer(work)) {
-            if (!closed) {
+        boolean offered;
+        synchronized (lifecycle) {
+            if (closed || shutdownRequested) {
+                return;
+            }
+            receivedPackets.incrementAndGet();
+            offered = workQueue.offer(work);
+        }
+        if (!offered) {
+            if (!closed && !shutdownRequested) {
                 overloadDroppedPackets.incrementAndGet();
                 requestControl(state, ControlAction.DISCARD);
             }
@@ -180,7 +187,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
     }
 
     public void discard(UUID playerId) {
-        if (closed || playerId == null) {
+        if (closed || shutdownRequested || playerId == null) {
             return;
         }
         PlayerState state = states.computeIfAbsent(playerId,
@@ -189,6 +196,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
     }
 
     public void finish(UUID playerId) {
+        if (closed || shutdownRequested || playerId == null) {
+            return;
+        }
         requestControl(playerId, ControlAction.FINISH);
     }
 
@@ -198,7 +208,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
      * packet for that player has created a state entry.
      */
     public void endPlayer(UUID playerId) {
-        if (closed || playerId == null) {
+        if (closed || shutdownRequested || playerId == null) {
             return;
         }
         PlayerState state = states.computeIfAbsent(playerId,
@@ -211,6 +221,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     /** Clears the quit barrier; privacy and permission checks still apply. */
     public void resumePlayer(UUID playerId) {
+        if (closed || shutdownRequested) {
+            return;
+        }
         PlayerState state = states.get(playerId);
         if (state != null) {
             state.accepting = true;
@@ -219,7 +232,7 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     /** Pauses packet admission and finishes/discards the current sessions. */
     public void pause() {
-        if (closed) {
+        if (closed || shutdownRequested) {
             return;
         }
         capturePaused = true;
@@ -230,13 +243,13 @@ public final class VoiceRecordingManager implements AutoCloseable {
 
     /** Resumes packet admission after a voice-server pause. */
     public void resume() {
-        if (!closed) {
+        if (!closed && !shutdownRequested) {
             capturePaused = false;
         }
     }
 
     public void reload() {
-        if (closed) {
+        if (closed || shutdownRequested) {
             return;
         }
         ControlAction action = settings.get().recording().enabled()
@@ -292,6 +305,10 @@ public final class VoiceRecordingManager implements AutoCloseable {
         return worker.isAlive();
     }
 
+    boolean shutdownRequested() {
+        return shutdownRequested;
+    }
+
     public boolean workerStopped() {
         return !worker.isAlive();
     }
@@ -316,8 +333,8 @@ public final class VoiceRecordingManager implements AutoCloseable {
                 try {
                     work = workQueue.poll(WORKER_POLL_MILLISECONDS, TimeUnit.MILLISECONDS);
                 } catch (InterruptedException ignored) {
-                    // close() interrupts the poll to make shutdown prompt; accepted
-                    // packets still drain because the loop exits only after the queue is empty.
+                    // The shutdown fallback may interrupt a non-cooperative decoder;
+                    // accepted packets still drain on the normal shutdown path.
                 }
 
                 drainPendingControls();
@@ -338,6 +355,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
                 if (shutdownRequested && workQueue.isEmpty()) {
                     drainPendingControls();
                     closeAllSessions(true);
+                    synchronized (lifecycle) {
+                        closed = true;
+                    }
                     return;
                 }
             }
@@ -561,10 +581,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
      */
     public boolean shutdown() {
         synchronized (lifecycle) {
-            if (!closed) {
-                closed = true;
+            if (!shutdownRequested) {
                 shutdownRequested = true;
-                worker.interrupt();
+                capturePaused = true;
             }
         }
         if (Thread.currentThread() == worker) {
@@ -578,6 +597,9 @@ public final class VoiceRecordingManager implements AutoCloseable {
             Thread.currentThread().interrupt();
         }
         if (!stopped && worker.isAlive()) {
+            synchronized (lifecycle) {
+                closed = true;
+            }
             clearQueuedWork();
             closeActiveDecoders();
             logger.warning("Voice capture worker did not stop within the shutdown timeout; clearing queued work, closing decoders, and interrupting it.");

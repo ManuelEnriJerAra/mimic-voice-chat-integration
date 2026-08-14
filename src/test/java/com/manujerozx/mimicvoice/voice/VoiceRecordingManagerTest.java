@@ -184,6 +184,43 @@ class VoiceRecordingManagerTest {
     }
 
     @Test
+    void normalShutdownDrainsAcceptedPacketsAndFlushesActiveSession() throws Exception {
+        FakeDecoder decoder = new FakeDecoder();
+        decoder.gatePayload(1);
+        decoder.ignoreInterruptions();
+        decoder.output = ignored -> speechFrame(8_000);
+        try (Harness harness = new Harness(4, () -> decoder)) {
+            send(harness, 1);
+            assertTrue(decoder.decodeEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            send(harness, 2);
+
+            AtomicReference<Boolean> shutdownResult = new AtomicReference<>();
+            Thread shutdown = Thread.ofPlatform().start(
+                    () -> shutdownResult.set(harness.manager.shutdown()));
+            long deadline = System.nanoTime() + TEST_TIMEOUT.toNanos();
+            while (!harness.manager.shutdownRequested() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertTrue(harness.manager.shutdownRequested(), "shutdown must close packet admission first");
+            long receivedBeforeLatePacket = harness.manager.receivedPackets();
+            send(harness, 3);
+            assertEquals(receivedBeforeLatePacket, harness.manager.receivedPackets(),
+                    "packets submitted after shutdown begins must not be accepted");
+
+            decoder.releaseGate();
+            shutdown.join(TEST_TIMEOUT.toMillis());
+            assertFalse(shutdown.isAlive());
+            assertEquals(Boolean.TRUE, shutdownResult.get());
+            assertEquals(List.of(1, 2), decoder.payloads,
+                    "shutdown must drain packets accepted before its admission boundary");
+            assertEquals(1, harness.saved.size(), "shutdown must flush the active session");
+            assertEquals(2 * PluginSettings.FRAME_SIZE, harness.saved.get(0).samples().length);
+            assertEquals(1, harness.manager.acceptedSegments());
+            assertEquals(0, harness.manager.activeSessions());
+        }
+    }
+
+    @Test
     void quitBarrierDropsLatePacketsUntilPlayerResumes() throws Exception {
         FakeDecoder first = new FakeDecoder();
         first.gatePayload(2);

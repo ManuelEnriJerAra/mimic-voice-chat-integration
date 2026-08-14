@@ -42,8 +42,10 @@ The plugin detects Mimics through the stable `mimic:mimic` persistent-data marke
 The preferred identity contract is `mimic:mimicked_player_uuid`; when present and
 valid, that UUID is authoritative. The legacy `mimic:mimicked_player` name remains
 supported for existing Mimic 1.0.0 entities and is resolved against an exact online
-player first, then the persisted clip name index. Existing Mimics and recordings do
-not need to be deleted. The UUID marker must be written by compatible Mimic-side
+player first, then the persisted clip name index only when that name identifies one
+UUID. Reused or ambiguous offline names remain unresolved rather than selecting a
+different player's clips. Existing Mimics and recordings do not need to be deleted.
+The UUID marker must be written by compatible Mimic-side
 code; this addon does not claim that Mimic 1.0.0 produces it. The carrier has no
 Bukkit custom name, preventing a mob-style proximity tag; LibsDisguises renders the
 normal player nametag.

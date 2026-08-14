@@ -112,7 +112,8 @@ active sessions, closes their Opus decoders, and is joined before storage is
 closed. New packets and post-shutdown clip admission are rejected once shutdown
 begins. If a third-party decoder ignores both `close()` and interruption, the
 plugin reports a failed, fail-closed capture shutdown rather than claiming a
-terminal worker state. Consent, bounded playback reads, and bounded storage work
+terminal worker state; the timeout fallback may discard work that could not be
+drained. Consent, bounded playback reads, and bounded storage work
 are then closed on their respective workers; storage similarly reports a
 non-terminal worker instead of permitting post-close index mutation.
 
@@ -453,7 +454,8 @@ If the UUID marker is absent, the legacy name (or the existing Bukkit custom-nam
 fallback when the key is absent) is resolved in this order:
 
 1. An exact online player name, yielding the current UUID.
-2. The name index loaded from saved clips, for offline playback.
+2. The name index loaded from saved clips, for offline playback, only when the
+   name maps to exactly one UUID. Reused or ambiguous names remain unresolved.
 
 The clip selector receives only the resulting UUID. It never falls back to another
 player's pool. If neither marker nor legacy name can be resolved, the Mimic waits
@@ -537,7 +539,9 @@ deletion is queued, and playback selection for the affected scope is suppressed
 until the clear future completes. The confirmation or explicit failure message
 is sent back on the Bukkit thread after the operation completes. A capture
 already in progress may still produce a later clip unless recording is denied or
-disabled; a failed clear never claims that deletion was confirmed.
+disabled; filesystem failures, including accepted or quarantined clip deletion
+failures, complete the clear exceptionally and are never presented as confirmed
+deletion.
 
 ## 12. Configuration reference
 
@@ -638,7 +642,7 @@ already processed into the active session.
 On plugin shutdown, no new packets are accepted. The capture worker drains its
 accepted queue, flushes active sessions, closes decoders, and is joined for up to
 ten seconds (with a final cancellation/interrupt fallback that clears queued
-work). If it remains live because a third-party decoder is non-cooperative,
+work that could not be drained). If it remains live because a third-party decoder is non-cooperative,
 shutdown is reported as failed and publication stays disabled. Bounded read and
 storage workers are then closed with their own completion windows and a second
 terminal check; a failed check is logged explicitly and post-close
