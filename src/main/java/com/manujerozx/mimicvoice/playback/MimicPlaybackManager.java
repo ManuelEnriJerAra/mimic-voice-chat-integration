@@ -1,15 +1,16 @@
 package com.manujerozx.mimicvoice.playback;
 
+import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
-import java.util.logging.Level;
 
 import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
@@ -45,8 +46,9 @@ public final class MimicPlaybackManager implements AutoCloseable {
     private final Supplier<PluginSettings> settings;
     private final Supplier<VoicechatServerApi> apiSupplier;
     private final MimicIdentityResolver identityResolver = new MimicIdentityResolver();
-    private final Map<UUID, PlaybackState> states = new HashMap<>();
-    private long startedPlaybacks;
+    private final Map<UUID, Vindicator> currentMimics = new HashMap<>();
+    private final Map<UUID, String> lastMalformedUuidMarkers = new HashMap<>();
+    private final MimicPlaybackController controller;
     private BukkitTask task;
 
     public MimicPlaybackManager(MimicSimpleVoiceChatIntegration plugin, ClipStore clipStore,
@@ -56,6 +58,23 @@ public final class MimicPlaybackManager implements AutoCloseable {
         this.clipStore = clipStore;
         this.settings = settings;
         this.apiSupplier = apiSupplier;
+        this.controller = new MimicPlaybackController(
+                settings,
+                new MimicPlaybackController.ClipSource() {
+                    @Override
+                    public VoiceClip select(UUID playerId, String previousClipId) {
+                        return clipStore.select(playerId, previousClipId);
+                    }
+
+                    @Override
+                    public CompletableFuture<short[]> read(VoiceClip clip) {
+                        return clipStore.read(clip);
+                    }
+                },
+                this::createPlayback,
+                runnable -> Bukkit.getScheduler().runTask(plugin, runnable),
+                System::currentTimeMillis,
+                this::randomDelayMillis);
     }
 
     public void start() {
@@ -63,146 +82,48 @@ public final class MimicPlaybackManager implements AutoCloseable {
     }
 
     public void reload() {
-        long now = System.currentTimeMillis();
-        states.values().forEach(state -> {
-            state.identity.invalidate();
-            state.identity.setNextPlaybackAt(now);
-            stopPlayback(state);
-        });
+        controller.reload();
     }
 
     public int trackedMimics() {
-        return states.size();
+        return controller.trackedMimics();
     }
 
     public int activePlaybacks() {
-        return (int) states.values().stream().filter(state -> state.playback != null).count();
+        return controller.activePlaybacks();
     }
 
     public long startedPlaybacks() {
-        return startedPlaybacks;
+        return controller.startedPlaybacks();
     }
 
     private void tick() {
-        PluginSettings.Playback playbackSettings = settings.get().playback();
         VoicechatServerApi api = apiSupplier.get();
-        if (!playbackSettings.enabled() || api == null) {
-            suspendAllPlaybacks();
+        if (!settings.get().playback().enabled() || api == null) {
+            currentApi = api;
+            controller.tick(List.of(), false);
             return;
         }
 
-        long now = System.currentTimeMillis();
-        Set<UUID> seen = new HashSet<>();
+        Map<UUID, Vindicator> scannedMimics = new HashMap<>();
+        var targets = new ArrayList<MimicPlaybackController.Target>();
         for (World world : Bukkit.getWorlds()) {
             for (Vindicator mimic : world.getEntitiesByClass(Vindicator.class)) {
                 if (!isMimic(mimic) || !mimic.isValid() || mimic.isDead()) {
                     continue;
                 }
-                seen.add(mimic.getUniqueId());
-                PlaybackState state = states.computeIfAbsent(mimic.getUniqueId(), ignored -> {
-                    PlaybackState created = new PlaybackState();
-                    created.identity.setNextPlaybackAt(now + randomDelayMillis(
-                            playbackSettings.firstMinimumSeconds(), playbackSettings.firstMaximumSeconds()));
-                    return created;
-                });
-                tickMimic(api, mimic, state, playbackSettings, now);
+                scannedMimics.put(mimic.getUniqueId(), mimic);
+                targets.add(new MimicPlaybackController.Target(
+                        mimic.getUniqueId(), true, true, false,
+                        nearbyVoiceListeners(api, mimic, settings.get().playback().distance()),
+                        resolveIdentity(mimic)));
             }
         }
-
-        for (UUID entityId : new HashSet<>(states.keySet())) {
-            if (!seen.contains(entityId)) {
-                PlaybackState removed = states.remove(entityId);
-                if (removed != null) {
-                    removed.identity.invalidate();
-                }
-                stopPlayback(removed);
-            }
-        }
-    }
-
-    private void tickMimic(VoicechatServerApi api, Vindicator mimic, PlaybackState state,
-                           PluginSettings.Playback playbackSettings, long now) {
-        MimicIdentityResolver.Resolution identity = resolveIdentity(mimic, state);
-        MimicIdentityResolver.IdentityKey requestedIdentity = identity.identityKey();
-        state.identity.updateIdentity(
-                requestedIdentity,
-                now,
-                randomDelayMillis(playbackSettings.firstMinimumSeconds(), playbackSettings.firstMaximumSeconds()),
-                () -> stopPlayback(state));
-
-        UUID mimickedPlayerId = identity.playerId();
-        if (mimickedPlayerId == null) {
-            state.identity.setNextPlaybackAt(now + playbackSettings.retryWithoutClipSeconds() * 1_000L);
-            return;
-        }
-        if (state.identity.loading() || state.playback != null
-                || now < state.identity.nextPlaybackAt()) {
-            if (state.playback != null) {
-                state.playback.updateLocation(mimic);
-            }
-            return;
-        }
-        if (nearbyVoiceListeners(api, mimic, playbackSettings.distance())
-                < playbackSettings.minimumNearbyListeners()) {
-            state.identity.setNextPlaybackAt(now + 1_000L);
-            return;
-        }
-
-        VoiceClip clip = clipStore.select(mimickedPlayerId, state.identity.lastClipId());
-        if (clip == null) {
-            state.identity.setNextPlaybackAt(now + playbackSettings.retryWithoutClipSeconds() * 1_000L);
-            return;
-        }
-
-        long identityVersion = state.identity.identityVersion();
-        state.identity.setLoading(true);
-        state.identity.setNextPlaybackAt(Long.MAX_VALUE);
-        clipStore.read(clip).whenComplete((samples, failure) -> {
-            if (!plugin.isEnabled()) {
-                return;
-            }
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                if (states.get(mimic.getUniqueId()) != state
-                        || !state.identity.isCurrent(identityVersion, requestedIdentity)) {
-                    return;
-                }
-                state.identity.setLoading(false);
-                if (failure != null) {
-                    plugin.getLogger().log(Level.WARNING, "Could not load a Mimic voice clip", failure);
-                    scheduleRetry(state, playbackSettings, System.currentTimeMillis());
-                    return;
-                }
-                if (samples == null || !mimic.isValid() || mimic.isDead()
-                        || state.playback != null || apiSupplier.get() != api
-                        || !settings.get().playback().enabled()
-                        || !isCurrentIdentity(mimic, state, requestedIdentity)) {
-                    scheduleRetry(state, playbackSettings, System.currentTimeMillis());
-                    return;
-                }
-                play(api, mimic, state, clip, samples, playbackSettings);
-            });
-        });
-    }
-
-    private void play(VoicechatServerApi api, Vindicator mimic, PlaybackState state,
-                      VoiceClip clip, short[] samples, PluginSettings.Playback playbackSettings) {
-        LocationalAudioChannel channel = api.createLocationalAudioChannel(
-                UUID.randomUUID(), api.fromServerLevel(mimic.getWorld()), position(api, mimic));
-        if (channel == null) {
-            scheduleRetry(state, playbackSettings, System.currentTimeMillis());
-            return;
-        }
-        channel.setDistance(playbackSettings.distance());
-        channel.setCategory(MimicVoicechatAddon.VOLUME_CATEGORY);
-
-        short[] adjusted = applyGain(samples, playbackSettings.volume());
-        AudioPlayer audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), adjusted);
-        ActivePlayback handle = new ActivePlayback(api, audioPlayer, channel, state);
-        audioPlayer.setOnStopped(handle::finish);
-        state.playback = handle;
-        state.identity.setLastClipId(clip.id());
-        startedPlaybacks++;
-        audioPlayer.startPlaying();
+        currentApi = api;
+        currentMimics.clear();
+        currentMimics.putAll(scannedMimics);
+        lastMalformedUuidMarkers.keySet().retainAll(scannedMimics.keySet());
+        controller.tick(targets, true);
     }
 
     private de.maxhenkel.voicechat.api.Position position(VoicechatServerApi api, Vindicator mimic) {
@@ -233,7 +154,7 @@ public final class MimicPlaybackManager implements AutoCloseable {
         return entity.getPersistentDataContainer().has(MIMIC_MARKER, PersistentDataType.BYTE);
     }
 
-    private MimicIdentityResolver.Resolution resolveIdentity(Vindicator mimic, PlaybackState state) {
+    private MimicIdentityResolver.Resolution resolveIdentity(Vindicator mimic) {
         String uuidMarker = mimic.getPersistentDataContainer()
                 .get(MIMICKED_PLAYER_UUID, PersistentDataType.STRING);
         String legacyName = mimic.getPersistentDataContainer()
@@ -245,13 +166,13 @@ public final class MimicPlaybackManager implements AutoCloseable {
                 this::onlinePlayerId,
                 clipStore::findPlayerId);
         if (resolution.source() == MimicIdentityResolver.Source.MALFORMED_UUID_MARKER) {
-            if (!Objects.equals(state.lastMalformedUuidMarker, uuidMarker)) {
+            if (!Objects.equals(lastMalformedUuidMarkers.get(mimic.getUniqueId()), uuidMarker)) {
                 plugin.getLogger().warning("Ignoring malformed mimic:mimicked_player_uuid on Mimic "
                         + mimic.getUniqueId() + "; legacy name fallback is disabled until it is corrected.");
-                state.lastMalformedUuidMarker = uuidMarker;
+                lastMalformedUuidMarkers.put(mimic.getUniqueId(), uuidMarker);
             }
         } else {
-            state.lastMalformedUuidMarker = null;
+            lastMalformedUuidMarkers.remove(mimic.getUniqueId());
         }
         return resolution;
     }
@@ -261,51 +182,35 @@ public final class MimicPlaybackManager implements AutoCloseable {
         return onlinePlayer == null ? null : onlinePlayer.getUniqueId();
     }
 
-    private boolean isCurrentIdentity(Vindicator mimic, PlaybackState state,
-                                      MimicIdentityResolver.IdentityKey expectedIdentity) {
-        return Objects.equals(resolveIdentity(mimic, state).identityKey(), expectedIdentity);
-    }
-
-    private short[] applyGain(short[] samples, double gain) {
-        if (Math.abs(gain - 1.0) < 1.0e-6) {
-            return samples;
+    private MimicPlaybackController.PlaybackHandle createPlayback(
+            MimicPlaybackController.Target target, VoiceClip clip, short[] samples,
+            double gain, Consumer<MimicPlaybackController.PlaybackHandle> stopped) {
+        VoicechatServerApi api = apiSupplier.get();
+        Vindicator mimic = currentMimics.get(target.entityId());
+        if (api == null || api != currentApi || mimic == null || !mimic.isValid() || mimic.isDead()
+                || !settings.get().playback().enabled()
+                || !Objects.equals(resolveIdentity(mimic).identityKey(), target.identityKey())) {
+            return null;
         }
-        short[] adjusted = new short[samples.length];
-        for (int index = 0; index < samples.length; index++) {
-            int scaled = (int) Math.round(samples[index] * gain);
-            adjusted[index] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, scaled));
+
+        LocationalAudioChannel channel = api.createLocationalAudioChannel(
+                UUID.randomUUID(), api.fromServerLevel(mimic.getWorld()), position(api, mimic));
+        if (channel == null) {
+            return null;
         }
-        return adjusted;
-    }
+        channel.setDistance(settings.get().playback().distance());
+        channel.setCategory(MimicVoicechatAddon.VOLUME_CATEGORY);
 
-    private void stopAllPlaybacks() {
-        states.values().forEach(state -> {
-            state.identity.invalidate();
-            stopPlayback(state);
-        });
-    }
-
-    private void suspendAllPlaybacks() {
-        long retryAt = System.currentTimeMillis() + 1_000L;
-        states.values().forEach(state -> {
-            if (state.identity.loading()) {
-                state.identity.invalidate();
-            }
-            state.identity.setNextPlaybackAt(retryAt);
-            stopPlayback(state);
-        });
-    }
-
-    private void scheduleRetry(PlaybackState state, PluginSettings.Playback playbackSettings, long now) {
-        state.identity.setNextPlaybackAt(now + playbackSettings.retryWithoutClipSeconds() * 1_000L);
-    }
-
-    private void stopPlayback(PlaybackState state) {
-        if (state != null && state.playback != null) {
-            ActivePlayback playback = state.playback;
-            state.playback = null;
-            playback.stop();
+        short[] adjusted = MimicPlaybackController.applyGain(samples, gain);
+        AudioPlayer audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), adjusted);
+        if (audioPlayer == null) {
+            return null;
         }
+        ActivePlayback handle = new ActivePlayback(api, audioPlayer, channel,
+                () -> currentMimics.get(target.entityId()), stopped);
+        audioPlayer.setOnStopped(handle::finish);
+        audioPlayer.startPlaying();
+        return handle;
     }
 
     @Override
@@ -314,38 +219,40 @@ public final class MimicPlaybackManager implements AutoCloseable {
             task.cancel();
             task = null;
         }
-        stopAllPlaybacks();
-        states.clear();
+        controller.close();
+        currentMimics.clear();
+        lastMalformedUuidMarkers.clear();
+        currentApi = null;
     }
 
-    private static final class PlaybackState {
-        private final MimicIdentityTracker identity = new MimicIdentityTracker();
-        private String lastMalformedUuidMarker;
-        private ActivePlayback playback;
-    }
-
-    private final class ActivePlayback {
+    private final class ActivePlayback implements MimicPlaybackController.PlaybackHandle {
         private final AudioPlayer player;
         private final VoicechatServerApi api;
         private final LocationalAudioChannel channel;
-        private final PlaybackState state;
+        private final Supplier<Vindicator> mimicSupplier;
+        private final Consumer<MimicPlaybackController.PlaybackHandle> stopped;
         private final AtomicBoolean finished = new AtomicBoolean();
 
         private ActivePlayback(VoicechatServerApi api, AudioPlayer player,
-                               LocationalAudioChannel channel, PlaybackState state) {
+                               LocationalAudioChannel channel, Supplier<Vindicator> mimicSupplier,
+                               Consumer<MimicPlaybackController.PlaybackHandle> stopped) {
             this.api = api;
             this.player = player;
             this.channel = channel;
-            this.state = state;
+            this.mimicSupplier = mimicSupplier;
+            this.stopped = stopped;
         }
 
-        private void updateLocation(Vindicator mimic) {
-            if (!finished.get()) {
+        @Override
+        public void update(MimicPlaybackController.Target target) {
+            Vindicator mimic = mimicSupplier.get();
+            if (!finished.get() && mimic != null && mimic.isValid() && !mimic.isDead()) {
                 channel.updateLocation(position(api, mimic));
             }
         }
 
-        private void stop() {
+        @Override
+        public void stop() {
             player.stopPlaying();
         }
 
@@ -353,17 +260,9 @@ public final class MimicPlaybackManager implements AutoCloseable {
             if (!finished.compareAndSet(false, true)) {
                 return;
             }
-            if (plugin.isEnabled()) {
-                Bukkit.getScheduler().runTask(plugin, () -> {
-                    if (state.playback == this) {
-                        state.playback = null;
-                        PluginSettings.Playback playbackSettings = settings.get().playback();
-                        state.identity.setNextPlaybackAt(System.currentTimeMillis() + randomDelayMillis(
-                                playbackSettings.repeatMinimumSeconds(),
-                                playbackSettings.repeatMaximumSeconds()));
-                    }
-                });
-            }
+            stopped.accept(this);
         }
     }
+
+    private VoicechatServerApi currentApi;
 }

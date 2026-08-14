@@ -220,8 +220,13 @@ public final class ClipStore implements AutoCloseable {
                 .sum();
     }
 
-    /** Test seam: places a FIFO barrier after currently queued storage work. */
-    CompletableFuture<Void> awaitIdle() {
+    /**
+     * Places a FIFO barrier after currently queued storage work.
+     *
+     * <p>This is also used by deterministic component tests that combine the
+     * asynchronous storage boundary with playback selection.</p>
+     */
+    public CompletableFuture<Void> awaitIdle() {
         CompletableFuture<Void> barrier = new CompletableFuture<>();
         try {
             ioExecutor.execute(() -> barrier.complete(null));

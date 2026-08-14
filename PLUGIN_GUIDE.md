@@ -37,7 +37,7 @@ The Maven project currently targets:
 | Component | Version or requirement |
 | --- | --- |
 | Java | 25 (`maven.compiler.release`) |
-| Paper API | `26.1.2.build.74-stable`, provided by the server |
+| Paper API | `26.1.2.build.74-stable` on API line `26.1`, provided by the server |
 | Simple Voice Chat API | `2.6.20`, provided by the server |
 | Mimic | Installed server plugin, declared as a hard dependency |
 | Simple Voice Chat | Installed server plugin, declared as a hard dependency |
@@ -46,13 +46,15 @@ The Maven project currently targets:
 The Paper and voice-chat dependencies are marked `provided`, so they are not
 bundled into the jar. The resulting plugin must therefore run alongside the
 matching server plugins. The project does not include a shading or relocation
-step.
+step. In `plugin.yml`, `api-version: '26.1'` names the Paper API line; it is not
+the full Maven build string.
 
 Build and test commands:
 
 ```text
-mvn test
-mvn clean package
+mvn -B -ntp clean test
+mvn -B -ntp clean verify
+mvn -B -ntp clean package
 ```
 
 The plugin descriptor is `src/main/resources/plugin.yml`. It declares the main
@@ -71,7 +73,7 @@ the two permissions used by the plugin.
 | WAV I/O | `WavIO` | Reads and writes 16-bit mono PCM RIFF/WAVE files |
 | Storage | `ClipStore`, `VoiceClip` | Indexes clips, persists them, applies retention and pool limits, and serves playback reads |
 | Consent | `ConsentRegistry` | Persists player opt-outs in YAML |
-| Playback | `MimicPlaybackManager` | Finds Mimics, maps them to players, schedules clips, and creates spatial audio |
+| Playback | `MimicPlaybackManager`, `MimicPlaybackController` | The manager adapts Bukkit and Simple Voice Chat; the controller owns identity-sensitive scheduling, load generations, and playback state |
 
 ## 4. Plugin lifecycle
 
@@ -619,7 +621,7 @@ is closed afterward and gets its own ten-second completion window.
 
 ## 14. Automated tests
 
-The current test suite contains 50 passing tests:
+The current test suite contains 69 passing tests:
 
 - `WavIOTest` verifies 48 kHz mono PCM write/read round-tripping and temporary
   file cleanup after a successful write.
@@ -645,18 +647,35 @@ The current test suite contains 50 passing tests:
 - `MimicIdentityTrackerTest` verifies in-flight load invalidation, active
   playback stop callbacks, reset of last-clip state, and preservation of
   scheduling for an unchanged identity.
+- `MimicPlaybackControllerTest` verifies the playback boundary independently of
+  Bukkit: Mimic filtering, exact UUID ownership, legacy resolved-name input,
+  delay boundaries, listener gating, no-clip retry, identity/load generation
+  invalidation, removal/reload/API/setting shutdown, channel-follow updates,
+  gain clamping, alternate-clip selection, idempotent close, and main-thread
+  dispatch of storage completions.
+- `MimicVoicePipelineComponentTest` combines the real voice activity segmenter,
+  asynchronous `ClipStore` save/index, UUID-targeted selection, and the
+  playback request sink. It is a component test, not a live Paper or UDP test.
 - `VoiceRecordingManagerTest` verifies callback offload, per-player FIFO order,
   single-decoder serialization, bounded overflow recovery, consent-denial and
   finish/quit barriers, reload invalidation, normal accepted capture, idempotent
   worker shutdown, separate speech-acceptance/submission-failure counters, and a
   2,000-packet bounded-queue stress path.
 
-The tests cover the pure audio, storage, and consent components. They do not run
-an actual Paper server, Simple Voice Chat server, Mimic entity, or networked
-client, so plugin-event wiring and live spatial playback still require an
-integration test server for verification.
+The deterministic tests do not run an actual Paper server, Simple Voice Chat
+server, Mimic entity, or networked client. Bukkit scanning, plugin lifecycle,
+real PDC contents, and live spatial playback therefore still require the
+manual smoke test in `MANUAL_INTEGRATION_TEST.md`.
 
-## 15. Implementation notes and operational limitations
+## 15. Continuous integration and manual coverage
+
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`. It uses
+Temurin Java 25 with Maven dependency caching and runs `mvn -B -ntp clean verify`;
+the workflow has no deployment, release, or publishing step. The manual
+runbook covers the server/plugin/client wiring and UDP-backed spatial-audio
+checks that are intentionally not automated in this repository.
+
+## 16. Implementation notes and operational limitations
 
 These details are important when diagnosing behavior or extending the plugin:
 
@@ -697,7 +716,7 @@ These details are important when diagnosing behavior or extending the plugin:
 7. **The playback scanner currently targets Vindicators.** Mimic must expose its
    carrier as a `Vindicator` with the `mimic:mimic` marker for this integration to
    discover it.
-## 16. Files to inspect when changing behavior
+## 17. Files to inspect when changing behavior
 
 For common maintenance tasks, these are the primary change points:
 
@@ -709,7 +728,13 @@ For common maintenance tasks, these are the primary change points:
   `ClipStore.java` and `WavIO.java`.
 - Change player consent behavior in `ConsentRegistry.java` and the command/event
   handling in `MimicSimpleVoiceChatIntegration.java`.
-- Change Mimic discovery, timing, listener checks, or locational playback in
-  `MimicPlaybackManager.java`.
+- Change Bukkit discovery or locational voice-chat adaptation in
+  `MimicPlaybackManager.java`; change identity-sensitive timing, load
+  generations, or playback lifecycle in `MimicPlaybackController.java`.
+- Change deterministic playback/component coverage in
+  `MimicPlaybackControllerTest.java` and
+  `MimicVoicePipelineComponentTest.java`.
 - Change Simple Voice Chat event registration or volume-category setup in
   `MimicVoicechatAddon.java`.
+- Change the live smoke-test procedure in `MANUAL_INTEGRATION_TEST.md` and CI
+  triggers/verification in `.github/workflows/ci.yml`.

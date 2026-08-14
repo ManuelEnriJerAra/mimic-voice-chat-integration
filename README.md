@@ -20,7 +20,8 @@ nearby Simple Voice Chat client hears the same synchronized clip.
 
 ## Requirements
 
-- Paper matching the Mimic server (the project currently targets Paper 26.1.2)
+- Paper matching the Mimic server (the project currently targets Paper API line
+  26.1, compiled against `26.1.2.build.74-stable`)
 - Java 25
 - Mimic 1.0.0 or newer
 - Simple Voice Chat with API 2.6.20 (or a newer compatible API)
@@ -46,6 +47,10 @@ not need to be deleted. The UUID marker must be written by compatible Mimic-side
 code; this addon does not claim that Mimic 1.0.0 produces it. The carrier has no
 Bukkit custom name, preventing a mob-style proximity tag; LibsDisguises renders the
 normal player nametag.
+
+The plugin descriptor uses Paper API version `26.1` (the API line, not the full
+Maven build string). Paper and Simple Voice Chat APIs are provided by the server
+and are not bundled into the addon jar.
 
 ## Speech-only recording
 
