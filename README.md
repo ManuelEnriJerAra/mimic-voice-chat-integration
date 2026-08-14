@@ -20,7 +20,8 @@ nearby Simple Voice Chat client hears the same synchronized clip.
 
 ## Requirements
 
-- Paper matching the Mimic server (the project currently targets Paper 26.1.2)
+- Paper matching the Mimic server (the project currently targets Paper API line
+  26.1, compiled against `26.1.2.build.74-stable`)
 - Java 25
 - Mimic 1.0.0 or newer
 - Simple Voice Chat with API 2.6.20 (or a newer compatible API)
@@ -37,10 +38,21 @@ UDP port must already be configured and reachable.
 3. Restart the server. Do not use a plugin hot-loader for voice chat addons.
 4. Use `/mimicvoice status` to verify that the voice API is ready.
 
-The plugin detects Mimics through the stable `mimic:mimic` persistent-data marker
-and reads `mimic:mimicked_player` to select clips from the same player as the
-active LibsDisguises appearance. The carrier has no Bukkit custom name, preventing
-a mob-style proximity tag; LibsDisguises renders the normal player nametag.
+The plugin detects Mimics through the stable `mimic:mimic` persistent-data marker.
+The preferred identity contract is `mimic:mimicked_player_uuid`; when present and
+valid, that UUID is authoritative. The legacy `mimic:mimicked_player` name remains
+supported for existing Mimic 1.0.0 entities and is resolved against an exact online
+player first, then the persisted clip name index only when that name identifies one
+UUID. Reused or ambiguous offline names remain unresolved rather than selecting a
+different player's clips. Existing Mimics and recordings do not need to be deleted.
+The UUID marker must be written by compatible Mimic-side
+code; this addon does not claim that Mimic 1.0.0 produces it. The carrier has no
+Bukkit custom name, preventing a mob-style proximity tag; LibsDisguises renders the
+normal player nametag.
+
+The plugin descriptor uses Paper API version `26.1` (the API line, not the full
+Maven build string). Paper and Simple Voice Chat APIs are provided by the server
+and are not bundled into the addon jar.
 
 ## Speech-only recording
 
@@ -67,6 +79,23 @@ a rolling clip pool: once it is full, saving a new phrase deletes that player's
 oldest phrase. Retention cleanup runs periodically while the server is online.
 With persistence disabled, the bounded pool stays in memory only.
 
+The storage boundary is bounded in both directions: completed clips waiting for
+registration are admitted only while they fit the configured pending-write byte
+budget (64 MiB by default) and the fixed 256-save entry limit. In memory-only
+mode, the per-player pool is additionally subject to the global
+`storage.maximum-memory-audio-megabytes` cap (512 MiB by default); oldest memory
+clips are evicted when that cap is reached. Disk playback reads use a separate
+fixed 64-read queue; excess reads are rejected for a later playback retry rather
+than accumulating in an unbounded executor.
+
+Clear operations retain a reserved bounded control admission, so a saturated save
+queue cannot silently displace privacy deletion. Playback selection for the
+affected scope is suppressed until the asynchronous clear succeeds or fails;
+failure is reported explicitly and is never presented as confirmed deletion.
+Active playback PCM is also capped globally by
+`playback.maximum-active-audio-megabytes` (128 MiB by default); excess playbacks
+retry later without blocking the Bukkit thread.
+
 By default, each Mimic chooses another random clip after a random 5–20 second
 delay measured from the end of its previous clip. Playback uses a locational
 channel that follows the carrier, which remains compatible with LibsDisguises.
@@ -91,6 +120,15 @@ that session. Players can opt out without an administrator; opting out immediate
 discards their unfinished capture. Consent changes are saved with atomic file
 replacement, and a player is warned if persistence fails. Existing accepted and
 quarantined clips can be removed with the admin clear command.
+
+`/mimicvoice status` also reports the bounded capture queue depth/capacity,
+received and processed packet counts, overload drops, accepted speech segments,
+pending storage writes and their PCM byte total, successful/failed storage
+saves, save/read backpressure rejections, pending playback reads, and current
+memory-audio bytes, active playback PCM bytes, and playback PCM budget
+rejections. If recording or storage is overloaded, the plugin drops
+recording work without interrupting normal voice transmission; storage admission
+never blocks the capture worker.
 
 Voice recording laws and platform rules vary. The default join notice tells
 players what is happening and how to opt out; server owners are responsible for

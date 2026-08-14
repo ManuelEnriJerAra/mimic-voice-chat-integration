@@ -31,6 +31,13 @@ storage:
   persist-clips: true
   maximum-clips-per-player: 20
   retention-hours: 72
+  # Completed PCM clips waiting for disk/memory registration are capped at 64 MiB.
+  # At 48 kHz, 16-bit mono, one 30-second maximum clip is about 2.88 MiB, so
+  # this admits roughly 22 maximum-length writes before non-blocking rejection.
+  maximum-pending-write-megabytes: 64
+  # Used only when persist-clips is false. Older in-memory clips are evicted
+  # globally after this cap, in addition to maximum-clips-per-player.
+  maximum-memory-audio-megabytes: 512
 
 playback:
   enabled: true
@@ -40,6 +47,8 @@ playback:
   minimum-clip-seconds: 1.0
   minimum-nearby-listeners: 1
   # Playback is always restricted to the player whose appearance the Mimic copied.
+  # Active PCM passed to voice players is capped globally; excess playbacks retry later.
+  maximum-active-audio-megabytes: 128
 
   # Every Mimic independently chooses random clips at random times.
   first-delay-seconds:

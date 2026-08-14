@@ -1,7 +1,5 @@
 package com.manujerozx.mimicvoice.audio;
 
-import java.util.Arrays;
-
 import com.manujerozx.mimicvoice.PluginSettings;
 
 /** Applies the configured energy and hysteresis gates to a completed PCM clip. */
@@ -19,12 +17,11 @@ public final class SpeechQuality {
         int voicedFrames = 0;
         boolean sustaining = false;
         for (int offset = 0; offset < samples.length; offset += PluginSettings.FRAME_SIZE) {
-            int end = Math.min(samples.length, offset + PluginSettings.FRAME_SIZE);
-            short[] frame = Arrays.copyOfRange(samples, offset, end);
+            int length = Math.min(PluginSettings.FRAME_SIZE, samples.length - offset);
             double hysteresis = sustaining ? settings.releaseHysteresisDb() : 0.0;
-            boolean speech = VoiceActivitySegmenter.rmsDb(frame)
+            boolean speech = VoiceActivitySegmenter.rmsDb(samples, offset, length)
                     >= settings.activationDb() - hysteresis
-                    && VoiceActivitySegmenter.peakDb(frame) >= settings.peakDb() - hysteresis;
+                    && VoiceActivitySegmenter.peakDb(samples, offset, length) >= settings.peakDb() - hysteresis;
             frames++;
             if (speech) {
                 voicedFrames++;

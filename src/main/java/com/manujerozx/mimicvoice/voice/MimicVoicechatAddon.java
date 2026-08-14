@@ -2,9 +2,8 @@ package com.manujerozx.mimicvoice.voice;
 
 import java.util.logging.Logger;
 
-import org.bukkit.entity.Player;
-
 import de.maxhenkel.voicechat.api.VoicechatApi;
+import de.maxhenkel.voicechat.api.ServerPlayer;
 import de.maxhenkel.voicechat.api.VoicechatPlugin;
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
@@ -47,11 +46,17 @@ public final class MimicVoicechatAddon implements VoicechatPlugin, AutoCloseable
     }
 
     private void onMicrophonePacket(MicrophonePacketEvent event) {
-        if (!active || event.getSenderConnection() == null
-                || !(event.getSenderConnection().getPlayer().getPlayer() instanceof Player player)) {
+        if (!active || event.getSenderConnection() == null) {
             return;
         }
-        recordingManager.onMicrophonePacket(event.getVoicechat(), player,
+        ServerPlayer sender = event.getSenderConnection().getPlayer();
+        if (sender == null) {
+            return;
+        }
+        // Only use immutable Simple Voice Chat metadata on this packet thread.
+        // Bukkit Player methods are sampled into PlayerSnapshotCache on the
+        // Bukkit main thread by the integration.
+        recordingManager.onMicrophonePacket(event.getVoicechat(), sender.getUuid(),
                 event.getPacket().getOpusEncodedData(), event.getPacket().isWhispering());
     }
 
@@ -61,6 +66,7 @@ public final class MimicVoicechatAddon implements VoicechatPlugin, AutoCloseable
         }
         VoicechatServerApi api = event.getVoicechat();
         serverApi = api;
+        recordingManager.resume();
         api.registerVolumeCategory(api.volumeCategoryBuilder()
                 .setId(VOLUME_CATEGORY)
                 .setName("Mimic voices")
@@ -74,7 +80,7 @@ public final class MimicVoicechatAddon implements VoicechatPlugin, AutoCloseable
             return;
         }
         serverApi = null;
-        recordingManager.reload();
+        recordingManager.pause();
     }
 
     public VoicechatServerApi serverApi() {
