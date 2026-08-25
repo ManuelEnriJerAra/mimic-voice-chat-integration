@@ -20,7 +20,7 @@ server binaries, plugin jars, client mods, credentials, or private server data.
 ## Build and install
 
 1. Run `mvn -B -ntp clean package`.
-2. Copy `target/MimicSimpleVoiceChatIntegration-1.0.0.jar` into the server's
+2. Copy `target/MimicSimpleVoiceChatIntegration-1.0.1.jar` into the server's
    `plugins/` directory alongside Mimic and Simple Voice Chat.
 3. Start the server normally and wait for all three plugins to enable.
 4. Confirm `/mimicvoice status` reports a ready voice API and no startup error.
@@ -58,3 +58,4 @@ other personal or private server data before sharing logs.
 
 This runbook is a manual smoke test, not a claim of automated end-to-end UDP
 coverage. Automated CI runs the deterministic tests and builds the addon only.
+

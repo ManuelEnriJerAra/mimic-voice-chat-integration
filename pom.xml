@@ -6,7 +6,7 @@
 
     <groupId>com.manujerozx</groupId>
     <artifactId>mimic-simple-voice-chat-integration</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <packaging>jar</packaging>
 
     <licenses>
@@ -90,3 +90,4 @@
         </plugins>
     </build>
 </project>
+

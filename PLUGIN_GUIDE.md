@@ -41,7 +41,7 @@ The Maven project currently targets:
 | Simple Voice Chat API | `2.6.20`, provided by the server |
 | Mimic | Installed server plugin, declared as a hard dependency |
 | Simple Voice Chat | Installed server plugin, declared as a hard dependency |
-| Build artifact | `MimicSimpleVoiceChatIntegration-1.0.0.jar` |
+| Build artifact | `MimicSimpleVoiceChatIntegration-1.0.1.jar` |
 
 The Paper and voice-chat dependencies are marked `provided`, so they are not
 bundled into the jar. The resulting plugin must therefore run alongside the
@@ -774,3 +774,4 @@ For common maintenance tasks, these are the primary change points:
   `MimicVoicechatAddon.java`.
 - Change the live smoke-test procedure in `MANUAL_INTEGRATION_TEST.md` and CI
   triggers/verification in `.github/workflows/ci.yml`.
+

@@ -1,5 +1,5 @@
 name: MimicSimpleVoiceChatIntegration
-version: 1.0.0
+version: 1.0.1
 main: com.manujerozx.mimicvoice.MimicSimpleVoiceChatIntegration
 api-version: '26.1'
 prefix: MimicSimpleVoiceChat
@@ -20,3 +20,4 @@ permissions:
   mimicvoice.record:
     description: Allows speech from this player to enter the Mimic clip pool.
     default: true
+
