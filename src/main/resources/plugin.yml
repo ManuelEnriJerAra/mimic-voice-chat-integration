@@ -1,9 +1,9 @@
 name: MimicSimpleVoiceChatIntegration
 version: 1.0.1
-main: com.manujerozx.mimicvoice.MimicSimpleVoiceChatIntegration
+main: com.jerara04.mimicvoice.MimicSimpleVoiceChatIntegration
 api-version: '26.1'
 prefix: MimicSimpleVoiceChat
-authors: [ ManujeroZX ]
+authors: [ Jerara04 ]
 description: Gives Mimic creatures spatial playback of speech captured through Simple Voice Chat.
 depend:
   - Mimic
@@ -20,4 +20,3 @@ permissions:
   mimicvoice.record:
     description: Allows speech from this player to enter the Mimic clip pool.
     default: true
-

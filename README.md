@@ -136,10 +136,9 @@ providing any additional notice or consent flow their jurisdiction requires.
 
 ## License
 
-Copyright © 2026 ManujeroZX.
+Copyright © 2026 Jerara04.
 
 This addon is licensed under the
 [GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). Simple
 Voice Chat, Mimic, Paper, and other dependencies remain under their respective
 licenses.
-

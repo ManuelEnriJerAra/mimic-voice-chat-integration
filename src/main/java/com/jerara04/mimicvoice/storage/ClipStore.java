@@ -1,0 +1,1271 @@
+package com.jerara04.mimicvoice.storage;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Stream;
+
+import com.jerara04.mimicvoice.PluginSettings;
+import com.jerara04.mimicvoice.audio.SpeechQuality;
+import com.jerara04.mimicvoice.audio.WavIO;
+
+public final class ClipStore implements AutoCloseable {
+
+    static final int MAX_PENDING_SAVES = 256;
+    static final int MAX_BULK_IO_ADMISSIONS = MAX_PENDING_SAVES - 1;
+    static final int MAX_PENDING_READS = 64;
+    private static final long DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS = 10_000L;
+    private static final long DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS = 1_000L;
+
+    private final Path root;
+    private final Path quarantineRoot;
+    private final Logger logger;
+    private final Supplier<PluginSettings> settings;
+    private final ThreadPoolExecutor ioExecutor;
+    private final ThreadPoolExecutor readExecutor;
+    private final Thread maintenanceThread;
+    private final WavReader wavReader;
+    private final Runnable beforeSave;
+    private final Semaphore bulkIoAdmissions = new Semaphore(MAX_BULK_IO_ADMISSIONS);
+    private final Object mutationLock = new Object();
+    private final long shutdownTimeoutMilliseconds;
+    private final long shutdownFollowupMilliseconds;
+    private final PendingAudioBudget pendingAudioBudget = new PendingAudioBudget(MAX_PENDING_SAVES);
+    private final Set<PendingSave> pendingSaves = ConcurrentHashMap.newKeySet();
+    private final AtomicLong rejectedBackpressureCount = new AtomicLong();
+    private final AtomicLong failedSaveCount = new AtomicLong();
+    private final AtomicLong successfulSaveCount = new AtomicLong();
+    private final AtomicLong lastBackpressureLogAt = new AtomicLong();
+    private final AtomicLong rejectedReadCount = new AtomicLong();
+    private final AtomicLong lastReadBackpressureLogAt = new AtomicLong();
+    private final Map<UUID, CopyOnWriteArrayList<VoiceClip>> clips = new ConcurrentHashMap<>();
+    /**
+     * A legacy player name is only a safe offline lookup when it maps to one
+     * UUID.  Keep every observed owner so name reuse becomes unresolved rather
+     * than silently selecting the last clip registered.
+     */
+    private final Map<String, Set<UUID>> playersByName = new ConcurrentHashMap<>();
+    private final Set<PendingRead> pendingReads = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean clearAllInProgress =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private final Map<UUID, java.util.concurrent.atomic.AtomicInteger> pendingPlayerClears =
+            new ConcurrentHashMap<>();
+    private volatile boolean closed;
+    private volatile boolean workersStopped;
+
+    public ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings) {
+        this(root, logger, settings, WavIO::read, () -> { },
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings, WavReader wavReader) {
+        this(root, logger, settings, wavReader, () -> { },
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings,
+              WavReader wavReader, Runnable beforeSave) {
+        this(root, logger, settings, wavReader, beforeSave,
+                DEFAULT_SHUTDOWN_TIMEOUT_MILLISECONDS, DEFAULT_SHUTDOWN_FOLLOWUP_MILLISECONDS);
+    }
+
+    ClipStore(Path root, Logger logger, Supplier<PluginSettings> settings,
+              WavReader wavReader, Runnable beforeSave,
+              long shutdownTimeoutMilliseconds, long shutdownFollowupMilliseconds) {
+        if (shutdownTimeoutMilliseconds < 1L || shutdownFollowupMilliseconds < 1L) {
+            throw new IllegalArgumentException("shutdown timeouts must be positive");
+        }
+        this.root = root;
+        this.quarantineRoot = root.resolve("_rejected_noise");
+        this.logger = logger;
+        this.settings = settings;
+        this.wavReader = wavReader;
+        this.beforeSave = beforeSave;
+        this.shutdownTimeoutMilliseconds = shutdownTimeoutMilliseconds;
+        this.shutdownFollowupMilliseconds = shutdownFollowupMilliseconds;
+        this.ioExecutor = boundedExecutor("mimic-voice-storage", MAX_PENDING_SAVES);
+        // The worker itself occupies one slot, so the queue has one fewer
+        // entries than the public pending-read bound.
+        this.readExecutor = boundedExecutor("mimic-voice-read", MAX_PENDING_READS - 1);
+        this.maintenanceThread = Thread.ofPlatform().name("mimic-voice-storage-maintenance")
+                .daemon(true).unstarted(this::runMaintenanceLoop);
+        this.workersStopped = false;
+        this.maintenanceThread.start();
+    }
+
+    private static ThreadPoolExecutor boundedExecutor(String name, int queueCapacity) {
+        return new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(queueCapacity),
+                runnable -> Thread.ofPlatform().name(name).daemon(true).unstarted(runnable),
+                new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    private <T> CompletableFuture<T> submitControlIo(java.util.function.Supplier<T> task) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        try {
+            ioExecutor.execute(() -> {
+                try {
+                    if (closed) {
+                        result.completeExceptionally(new RejectedExecutionException(
+                                "voice clip storage is closed"));
+                        return;
+                    }
+                    result.complete(task.get());
+                } catch (Throwable failure) {
+                    result.completeExceptionally(failure);
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            result.completeExceptionally(exception);
+        }
+        return result;
+    }
+
+    private <T> CompletableFuture<T> submitBulkIo(java.util.function.Supplier<T> task) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        if (closed || !bulkIoAdmissions.tryAcquire()) {
+            result.completeExceptionally(new RejectedExecutionException(
+                    "voice clip storage bulk work is at capacity"));
+            return result;
+        }
+        try {
+            ioExecutor.execute(() -> {
+                try {
+                    if (closed) {
+                        result.completeExceptionally(new RejectedExecutionException(
+                                "voice clip storage is closed"));
+                        return;
+                    }
+                    result.complete(task.get());
+                } catch (Throwable failure) {
+                    result.completeExceptionally(failure);
+                } finally {
+                    bulkIoAdmissions.release();
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            bulkIoAdmissions.release();
+            result.completeExceptionally(exception);
+        }
+        return result;
+    }
+
+    private void runMaintenanceLoop() {
+        try {
+            while (!closed) {
+                Thread.sleep(TimeUnit.MINUTES.toMillis(5L));
+                if (closed) {
+                    return;
+                }
+                submitBulkIo(() -> {
+                    runRetentionMaintenance();
+                    return null;
+                }).whenComplete((ignored, failure) -> {
+                    if (failure != null && !closed) {
+                        logger.log(Level.FINE, "Could not queue voice clip retention maintenance", failure);
+                    }
+                });
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public CompletableFuture<Integer> initialize() {
+        return submitBulkIo(this::loadPersistedClips);
+    }
+
+    /** Queues a save without blocking and defensively owns caller-provided samples. */
+    public boolean save(UUID playerId, String playerName, short[] samples) {
+        return submitSave(playerId, playerName, samples, false);
+    }
+
+    /** Queues a save while taking ownership of a freshly completed segment. */
+    public boolean saveOwned(UUID playerId, String playerName, short[] samples) {
+        return submitSave(playerId, playerName, samples, true);
+    }
+
+    private boolean submitSave(UUID playerId, String playerName, short[] samples, boolean owned) {
+        if (closed || samples == null || samples.length == 0) {
+            return false;
+        }
+        long bytes = (long) samples.length * Short.BYTES;
+        if (!pendingAudioBudget.tryReserve(bytes, settings.get().storage().maximumPendingWriteBytes())) {
+            rejectForBackpressure(playerName);
+            return false;
+        }
+
+        if (!bulkIoAdmissions.tryAcquire()) {
+            releaseReservation(bytes);
+            rejectForBackpressure(playerName);
+            return false;
+        }
+
+        short[] ownedSamples;
+        PendingSave pending = null;
+        try {
+            ownedSamples = owned ? samples : samples.clone();
+            pending = new PendingSave(playerId, playerName, ownedSamples, bytes);
+            pendingSaves.add(pending);
+            ioExecutor.execute(pending);
+            return true;
+        } catch (RejectedExecutionException exception) {
+            if (pending == null) {
+                bulkIoAdmissions.release();
+                releaseReservation(bytes);
+            } else {
+                pending.cancel();
+            }
+            rejectForBackpressure(playerName);
+            logger.log(Level.WARNING, "Could not queue voice clip storage work", exception);
+            return false;
+        } catch (RuntimeException exception) {
+            if (pending == null) {
+                bulkIoAdmissions.release();
+                releaseReservation(bytes);
+            } else {
+                pending.cancel();
+            }
+            failedSaveCount.incrementAndGet();
+            logger.log(Level.WARNING, "Could not prepare voice clip storage work for "
+                    + safePlayerName(playerName), exception);
+            return false;
+        }
+    }
+
+    public VoiceClip select(UUID playerId, String previousClipId) {
+        if (playerId == null || clearAllInProgress.get() || pendingPlayerClears.containsKey(playerId)) {
+            return null;
+        }
+        List<VoiceClip> candidates = new ArrayList<>(
+                clips.getOrDefault(playerId, new CopyOnWriteArrayList<>()));
+        long cutoff = retentionCutoff();
+        double minimumSeconds = settings.get().playback().minimumClipSeconds();
+        candidates.removeIf(clip -> clip.createdAt() < cutoff
+                || clip.durationSeconds(PluginSettings.SAMPLE_RATE) < minimumSeconds);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        if (candidates.size() > 1 && previousClipId != null) {
+            candidates.removeIf(clip -> previousClipId.equals(clip.id()));
+        }
+        return candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+    }
+
+    public CompletableFuture<short[]> read(VoiceClip clip) {
+        if (closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (clip.memoryAudio() != null) {
+            return CompletableFuture.completedFuture(clip.memoryAudio().clone());
+        }
+        CompletableFuture<short[]> result = new CompletableFuture<>();
+        PendingRead pending = new PendingRead(clip, result);
+        pendingReads.add(pending);
+        try {
+            readExecutor.execute(pending);
+        } catch (RejectedExecutionException exception) {
+            pending.cancel();
+            rejectReadForBackpressure();
+        }
+        return result;
+    }
+
+    public CompletableFuture<Integer> clearAll() {
+        if (!clearAllInProgress.compareAndSet(false, true)) {
+            return CompletableFuture.failedFuture(new RejectedExecutionException(
+                    "voice clip clear-all is already pending"));
+        }
+        CompletableFuture<Integer> result = submitControlIo(() -> {
+            List<VoiceClip> snapshot;
+            List<VoiceClip> deleted = new ArrayList<>();
+            DeletionFailures failures = new DeletionFailures();
+            synchronized (mutationLock) {
+                if (closed) {
+                    throw new RejectedExecutionException("voice clip storage is closed");
+                }
+                snapshot = allClips();
+                snapshot.forEach(clip -> deleteFileForClear(clip, deleted, failures));
+                int quarantinedCount = deleteQuarantinedFilesForClear(null, failures);
+                removeEmptyDirectoriesForClear(failures);
+                if (failures.hasFailure()) {
+                    deleted.forEach(this::removeActiveClip);
+                    failures.throwIfPresent();
+                }
+                clips.clear();
+                playersByName.clear();
+                return snapshot.size() + quarantinedCount;
+            }
+        });
+        result.whenComplete((ignored, failure) -> clearAllInProgress.set(false));
+        return result;
+    }
+
+    public CompletableFuture<Integer> clearPlayer(UUID playerId) {
+        if (playerId == null) {
+            return CompletableFuture.completedFuture(0);
+        }
+        java.util.concurrent.atomic.AtomicInteger pending = pendingPlayerClears.computeIfAbsent(
+                playerId, missing -> new java.util.concurrent.atomic.AtomicInteger());
+        pending.incrementAndGet();
+        CompletableFuture<Integer> result = submitControlIo(() -> {
+            List<VoiceClip> candidates;
+            List<VoiceClip> deleted = new ArrayList<>();
+            DeletionFailures failures = new DeletionFailures();
+            synchronized (mutationLock) {
+                if (closed) {
+                    throw new RejectedExecutionException("voice clip storage is closed");
+                }
+                candidates = new ArrayList<>(clips.getOrDefault(playerId,
+                        new CopyOnWriteArrayList<>()));
+                candidates.forEach(clip -> deleteFileForClear(clip, deleted, failures));
+                int quarantinedCount = deleteQuarantinedFilesForClear(playerId, failures);
+                removeEmptyDirectoriesForClear(failures);
+                if (failures.hasFailure()) {
+                    deleted.forEach(this::removeActiveClip);
+                    failures.throwIfPresent();
+                }
+                clips.remove(playerId);
+                unindexPlayer(playerId);
+                return candidates.size() + quarantinedCount;
+            }
+        });
+        result.whenComplete((completedValue, failure) -> pendingPlayerClears.compute(playerId,
+                (playerKey, count) -> count == null || count.decrementAndGet() <= 0 ? null : count));
+        return result;
+    }
+
+    /**
+     * Resolves a legacy name only when the persisted index has one owner.
+     * Reused names are deliberately unresolved to avoid cross-player playback
+     * or deletion.
+     */
+    public UUID findPlayerId(String playerName) {
+        String normalized = normalizePlayerName(playerName);
+        if (normalized == null) {
+            return null;
+        }
+        synchronized (mutationLock) {
+            Set<UUID> owners = playersByName.get(normalized);
+            if (owners == null || owners.size() != 1) {
+                return null;
+            }
+            return owners.iterator().next();
+        }
+    }
+
+    public int clipCount() {
+        return clips.values().stream().mapToInt(List::size).sum();
+    }
+
+    public int playerCount() {
+        return (int) clips.values().stream().filter(list -> !list.isEmpty()).count();
+    }
+
+    public int pendingSaveCount() {
+        return pendingAudioBudget.pendingEntries();
+    }
+
+    public long pendingSaveBytes() {
+        return pendingAudioBudget.pendingBytes();
+    }
+
+    public long saveSucceeded() {
+        return successfulSaveCount.get();
+    }
+
+    public long saveFailures() {
+        return failedSaveCount.get();
+    }
+
+    public long saveRejectedBackpressure() {
+        return rejectedBackpressureCount.get();
+    }
+
+    public long memoryAudioBytes() {
+        return allClips().stream()
+                .filter(clip -> clip.memoryAudio() != null)
+                .mapToLong(clip -> (long) clip.samples() * Short.BYTES)
+                .sum();
+    }
+
+    public int pendingReadCount() {
+        return pendingReads.size();
+    }
+
+    public long readRejectedBackpressure() {
+        return rejectedReadCount.get();
+    }
+
+    /**
+     * Places a FIFO barrier after currently queued storage work.
+     *
+     * <p>This is also used by deterministic component tests that combine the
+     * asynchronous storage boundary with playback selection.</p>
+     */
+    public CompletableFuture<Void> awaitIdle() {
+        return submitBulkIo(() -> null);
+    }
+
+    private int loadPersistedClips() {
+        if (closed) {
+            return 0;
+        }
+        try {
+            Files.createDirectories(root);
+        } catch (IOException exception) {
+            logger.log(Level.SEVERE, "Could not create voice recording directory " + root, exception);
+            return 0;
+        }
+
+        if (closed) {
+            return 0;
+        }
+        long cutoff = retentionCutoff();
+        purgeExpiredQuarantinedFiles(cutoff);
+        if (closed || !settings.get().storage().persistClips()) {
+            return 0;
+        }
+        try (Stream<Path> playerDirectories = Files.list(root)) {
+            playerDirectories.filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS))
+                    .filter(path -> !path.equals(quarantineRoot))
+                    .forEach(directory -> loadPlayerDirectory(directory, cutoff));
+        } catch (IOException exception) {
+            logger.log(Level.WARNING, "Could not scan saved voice clips", exception);
+        }
+        if (closed) {
+            return 0;
+        }
+        clips.keySet().forEach(this::enforcePlayerLimit);
+        return clipCount();
+    }
+
+    private void loadPlayerDirectory(Path directory, long cutoff) {
+        if (closed) {
+            return;
+        }
+        UUID playerId;
+        try {
+            playerId = UUID.fromString(directory.getFileName().toString());
+        } catch (IllegalArgumentException exception) {
+            return;
+        }
+
+        try (Stream<Path> files = Files.list(directory)) {
+            files.filter(path -> path.getFileName().toString().endsWith(".wav"))
+                    .sorted()
+                    .forEach(path -> loadClip(playerId, path, cutoff));
+        } catch (IOException exception) {
+            logger.log(Level.WARNING, "Could not scan voice clips in " + directory, exception);
+        }
+    }
+
+    private void loadClip(UUID playerId, Path path, long cutoff) {
+        if (closed) {
+            return;
+        }
+        String fileName = path.getFileName().toString();
+        int separator = fileName.indexOf('_');
+        int randomSuffix = fileName.lastIndexOf('_');
+        int extension = fileName.lastIndexOf('.');
+        if (separator <= 0 || randomSuffix <= separator || extension <= randomSuffix) {
+            quarantineInvalidPersistedClip(path, playerId, null);
+            return;
+        }
+        try {
+            long createdAt = Long.parseLong(fileName.substring(0, separator));
+            if (createdAt < cutoff) {
+                if (!closed) {
+                    Files.deleteIfExists(path);
+                }
+                return;
+            }
+            String playerName = fileName.substring(separator + 1, randomSuffix);
+            if (closed) {
+                return;
+            }
+            WavIO.WavData data = WavIO.read(path);
+            if (closed) {
+                return;
+            }
+            if (data.sampleRate() != PluginSettings.SAMPLE_RATE || data.samples().length <= 0) {
+                quarantineInvalidPersistedClip(path, playerId, null);
+                return;
+            }
+            if (!SpeechQuality.hasEnoughSpeech(
+                    data.samples(), settings.get().recording().voiceActivity())) {
+                synchronized (mutationLock) {
+                    if (closed) {
+                        return;
+                    }
+                    indexPlayerName(playerName, playerId);
+                }
+                quarantine(path, playerId);
+                return;
+            }
+            synchronized (mutationLock) {
+                if (closed) {
+                    return;
+                }
+                register(new VoiceClip(fileName, playerId, playerName, path, null,
+                        data.samples().length, createdAt));
+            }
+        } catch (IOException | RuntimeException exception) {
+            quarantineInvalidPersistedClip(path, playerId, exception);
+        }
+    }
+
+    private short[] readNow(VoiceClip clip) {
+        if (closed) {
+            return null;
+        }
+        try {
+            WavIO.WavData data = wavReader.read(clip.path());
+            if (closed) {
+                return null;
+            }
+            if (data.sampleRate() != PluginSettings.SAMPLE_RATE) {
+                throw new IOException("Unexpected sample rate " + data.sampleRate());
+            }
+            return data.samples();
+        } catch (IOException | RuntimeException exception) {
+            invalidateUnreadableClip(clip, exception);
+            return null;
+        }
+    }
+
+    private void quarantineInvalidPersistedClip(Path path, UUID playerId, Exception failure) {
+        if (closed) {
+            return;
+        }
+        try {
+            if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                quarantine(path, playerId);
+            }
+        } catch (IOException quarantineFailure) {
+            logger.log(Level.WARNING, "Could not quarantine invalid saved voice clip " + path,
+                    quarantineFailure);
+        }
+        if (failure != null) {
+            logger.log(Level.WARNING, "Quarantined invalid saved voice clip " + path, failure);
+        }
+    }
+
+    private boolean saveNow(UUID playerId, String playerName, short[] samples) throws IOException {
+        if (closed) {
+            return false;
+        }
+        String safeName = safePlayerName(playerName);
+        long createdAt = System.currentTimeMillis();
+        String id = createdAt + "_" + safeName + "_" + UUID.randomUUID().toString().substring(0, 8);
+        PluginSettings.Storage storage = settings.get().storage();
+        if (!storage.persistClips()) {
+            synchronized (mutationLock) {
+                if (closed) {
+                    return false;
+                }
+                register(new VoiceClip(id, playerId, safeName, null, samples, samples.length, createdAt));
+                enforcePlayerLimit(playerId);
+                enforceMemoryLimit();
+            }
+            return true;
+        }
+
+        Path path = root.resolve(playerId.toString()).resolve(id + ".wav");
+        WavIO.write(path, samples, PluginSettings.SAMPLE_RATE);
+        synchronized (mutationLock) {
+            if (closed) {
+                Files.deleteIfExists(path);
+                return false;
+            }
+            register(new VoiceClip(id, playerId, safeName, path, null, samples.length, createdAt));
+            enforcePlayerLimit(playerId);
+        }
+        return true;
+    }
+
+    private void register(VoiceClip clip) {
+        clips.computeIfAbsent(clip.speakerId(), ignored -> new CopyOnWriteArrayList<>()).add(clip);
+        indexPlayerName(clip.speakerName(), clip.speakerId());
+    }
+
+    private void enforcePlayerLimit(UUID playerId) {
+        if (closed) {
+            return;
+        }
+        CopyOnWriteArrayList<VoiceClip> playerClips = clips.get(playerId);
+        if (playerClips == null) {
+            return;
+        }
+        long cutoff = retentionCutoff();
+        for (VoiceClip clip : new ArrayList<>(playerClips)) {
+            if (closed) {
+                return;
+            }
+            if (clip.createdAt() < cutoff) {
+                playerClips.remove(clip);
+                deleteFile(clip);
+            }
+        }
+        List<VoiceClip> ordered = new ArrayList<>(playerClips);
+        ordered.sort(Comparator.comparingLong(VoiceClip::createdAt).reversed());
+        int maximum = settings.get().storage().maximumClipsPerPlayer();
+        for (int index = maximum; index < ordered.size(); index++) {
+            if (closed) {
+                return;
+            }
+            VoiceClip expired = ordered.get(index);
+            playerClips.remove(expired);
+            deleteFile(expired);
+        }
+    }
+
+    private void enforceMemoryLimit() {
+        if (closed) {
+            return;
+        }
+        long maximumBytes = settings.get().storage().maximumMemoryAudioBytes();
+        List<VoiceClip> memoryClips = allClips().stream()
+                .filter(clip -> clip.memoryAudio() != null)
+                .sorted(Comparator.comparingLong(VoiceClip::createdAt))
+                .toList();
+        long totalBytes = memoryClips.stream()
+                .mapToLong(clip -> (long) clip.samples() * Short.BYTES)
+                .sum();
+        for (VoiceClip clip : memoryClips) {
+            if (closed) {
+                return;
+            }
+            if (totalBytes <= maximumBytes) {
+                break;
+            }
+            if (removeActiveClip(clip)) {
+                totalBytes -= (long) clip.samples() * Short.BYTES;
+            }
+        }
+    }
+
+    private void invalidateUnreadableClip(VoiceClip clip, Exception failure) {
+        synchronized (mutationLock) {
+            if (closed) {
+                return;
+            }
+            removeActiveClip(clip);
+            Path path = clip.path();
+            if (path != null && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                try {
+                    quarantine(path, clip.speakerId());
+                } catch (IOException quarantineFailure) {
+                    logger.log(Level.WARNING, "Could not quarantine unreadable voice clip " + path,
+                            quarantineFailure);
+                }
+            }
+            logger.log(Level.WARNING, "Removed unreadable voice clip from playback index " + path, failure);
+        }
+    }
+
+    private boolean removeActiveClip(VoiceClip clip) {
+        CopyOnWriteArrayList<VoiceClip> playerClips = clips.get(clip.speakerId());
+        if (playerClips == null || !playerClips.remove(clip)) {
+            return false;
+        }
+        if (playerClips.isEmpty()) {
+            clips.remove(clip.speakerId(), playerClips);
+        }
+        return true;
+    }
+
+    private void rejectForBackpressure(String playerName) {
+        rejectedBackpressureCount.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long previous = lastBackpressureLogAt.get();
+        if ((previous == 0L || now - previous >= 10_000L)
+                && lastBackpressureLogAt.compareAndSet(previous, now)) {
+            logger.warning("Voice clip storage backpressure rejected a clip for "
+                    + safePlayerName(playerName));
+        }
+    }
+
+    private void rejectReadForBackpressure() {
+        rejectedReadCount.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long previous = lastReadBackpressureLogAt.get();
+        if ((previous == 0L || now - previous >= 10_000L)
+                && lastReadBackpressureLogAt.compareAndSet(previous, now)) {
+            logger.warning("Voice clip playback read backpressure rejected a read; playback will retry later.");
+        }
+    }
+
+    private void releaseReservation(long bytes) {
+        pendingAudioBudget.release(bytes);
+    }
+
+    private long retentionCutoff() {
+        return System.currentTimeMillis()
+                - Duration.ofHours(settings.get().storage().retentionHours()).toMillis();
+    }
+
+    private List<VoiceClip> allClips() {
+        List<VoiceClip> snapshot = new ArrayList<>();
+        clips.values().forEach(snapshot::addAll);
+        return snapshot;
+    }
+
+    private void deleteFile(VoiceClip clip) {
+        if (clip.path() == null) {
+            return;
+        }
+        synchronized (mutationLock) {
+            if (closed) {
+                return;
+            }
+            try {
+                Files.deleteIfExists(clip.path());
+            } catch (IOException exception) {
+                logger.log(Level.WARNING, "Could not delete voice clip " + clip.path(), exception);
+            }
+        }
+    }
+
+    /**
+     * Deletes a clip as part of an explicit privacy clear. Retention
+     * maintenance remains best effort, but a user-requested clear must fail
+     * visibly when its path cannot be removed.
+     */
+    private void deleteFileForClear(VoiceClip clip, List<VoiceClip> deleted,
+                                    DeletionFailures failures) {
+        if (clip.path() == null) {
+            deleted.add(clip);
+            return;
+        }
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        try {
+            Files.deleteIfExists(clip.path());
+            deleted.add(clip);
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not delete voice clip " + clip.path(), exception);
+        }
+    }
+
+    private void quarantine(Path path, UUID playerId) throws IOException {
+        Path quarantineDirectory = quarantineRoot.resolve(playerId.toString());
+        Files.createDirectories(quarantineDirectory);
+        Path destination = quarantineDirectory.resolve(path.getFileName());
+        if (Files.exists(destination)) {
+            destination = quarantineDirectory.resolve(UUID.randomUUID() + "_" + path.getFileName());
+        }
+        Files.move(path, destination);
+        logger.info("Quarantined rejected voice clip " + path.getFileName());
+    }
+
+    private void purgeExpiredQuarantinedFiles(long cutoff) {
+        if (!Files.isDirectory(quarantineRoot, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        try (Stream<Path> directories = Files.list(quarantineRoot)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                UUID playerId = directoryPlayerId(directory);
+                try (Stream<Path> files = Files.list(directory)) {
+                    for (Path path : files
+                            .filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                            .filter(file -> file.getFileName().toString().endsWith(".wav")).toList()) {
+                        try {
+                            if (Files.getLastModifiedTime(path, LinkOption.NOFOLLOW_LINKS).toMillis() < cutoff) {
+                                Files.deleteIfExists(path);
+                            } else if (playerId != null) {
+                                indexQuarantinedPlayerName(path, playerId);
+                            }
+                        } catch (IOException exception) {
+                            logger.log(Level.WARNING, "Could not expire quarantined voice clip " + path,
+                                    exception);
+                        }
+                    }
+                } catch (IOException exception) {
+                    logger.log(Level.WARNING, "Could not scan quarantined voice clips in " + directory,
+                            exception);
+                }
+                deleteDirectoryIfEmpty(directory);
+            }
+        } catch (IOException exception) {
+            logger.log(Level.WARNING, "Could not scan quarantined voice clips", exception);
+        }
+        deleteDirectoryIfEmpty(quarantineRoot);
+    }
+
+    private UUID directoryPlayerId(Path directory) {
+        try {
+            return UUID.fromString(directory.getFileName().toString());
+        } catch (IllegalArgumentException exception) {
+            return null;
+        }
+    }
+
+    private void indexQuarantinedPlayerName(Path path, UUID playerId) {
+        String stem = path.getFileName().toString();
+        stem = stem.substring(0, stem.length() - ".wav".length());
+        int firstSeparator = stem.indexOf('_');
+        if (firstSeparator == 36) {
+            try {
+                UUID.fromString(stem.substring(0, firstSeparator));
+                stem = stem.substring(firstSeparator + 1);
+            } catch (IllegalArgumentException ignored) {
+                // The first field is the normal creation timestamp, not a collision prefix.
+            }
+        }
+        int timestampSeparator = stem.indexOf('_');
+        int suffixSeparator = stem.lastIndexOf('_');
+        if (timestampSeparator <= 0 || suffixSeparator <= timestampSeparator) {
+            return;
+        }
+        try {
+            Long.parseLong(stem.substring(0, timestampSeparator));
+            String playerName = stem.substring(timestampSeparator + 1, suffixSeparator);
+            if (!playerName.isBlank()) {
+                indexPlayerName(playerName, playerId);
+            }
+        } catch (NumberFormatException ignored) {
+            // Files without the plugin's normal naming scheme cannot be indexed by name.
+        }
+    }
+
+    private void indexPlayerName(String playerName, UUID playerId) {
+        String normalized = normalizePlayerName(playerName);
+        if (normalized == null || playerId == null) {
+            return;
+        }
+        synchronized (mutationLock) {
+            playersByName.computeIfAbsent(normalized,
+                    ignored -> ConcurrentHashMap.newKeySet()).add(playerId);
+        }
+    }
+
+    private void unindexPlayer(UUID playerId) {
+        if (playerId == null) {
+            return;
+        }
+        playersByName.entrySet().removeIf(entry -> {
+            Set<UUID> owners = entry.getValue();
+            owners.remove(playerId);
+            return owners.isEmpty();
+        });
+    }
+
+    private static String normalizePlayerName(String playerName) {
+        if (playerName == null || playerName.isBlank()) {
+            return null;
+        }
+        return playerName.toLowerCase(Locale.ROOT);
+    }
+
+    private void runRetentionMaintenance() {
+        try {
+            if (closed) {
+                return;
+            }
+            clips.keySet().forEach(this::enforcePlayerLimit);
+            if (closed) {
+                return;
+            }
+            enforceMemoryLimit();
+            if (closed) {
+                return;
+            }
+            purgeExpiredQuarantinedFiles(retentionCutoff());
+            if (closed) {
+                return;
+            }
+            removeEmptyDirectories();
+        } catch (RuntimeException exception) {
+            logger.log(Level.WARNING, "Voice clip retention maintenance failed", exception);
+        }
+    }
+
+    private int deleteQuarantinedFiles(UUID playerId) {
+        if (closed) {
+            return 0;
+        }
+        if (playerId != null) {
+            return deleteQuarantinedDirectory(quarantineRoot.resolve(playerId.toString()));
+        }
+        if (!Files.isDirectory(quarantineRoot, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> directories = Files.list(quarantineRoot)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                if (closed) {
+                    break;
+                }
+                deleted += deleteQuarantinedDirectory(directory);
+            }
+        } catch (IOException exception) {
+            logger.log(Level.WARNING, "Could not clear quarantined voice clips", exception);
+        }
+        deleteDirectoryIfEmpty(quarantineRoot);
+        return deleted;
+    }
+
+    private int deleteQuarantinedFilesForClear(UUID playerId, DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return 0;
+        }
+        if (playerId != null) {
+            return deleteQuarantinedDirectoryForClear(
+                    quarantineRoot.resolve(playerId.toString()), failures);
+        }
+        if (!Files.isDirectory(quarantineRoot, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> directories = Files.list(quarantineRoot)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                deleted += deleteQuarantinedDirectoryForClear(directory, failures);
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+        }
+        deleteDirectoryIfEmptyForClear(quarantineRoot, failures);
+        return deleted;
+    }
+
+    private int deleteQuarantinedDirectory(Path directory) {
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path path : files
+                    .filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                    .filter(file -> file.getFileName().toString().endsWith(".wav")).toList()) {
+                if (closed) {
+                    break;
+                }
+                try {
+                    if (Files.deleteIfExists(path)) {
+                        deleted++;
+                    }
+                } catch (IOException exception) {
+                    logger.log(Level.WARNING, "Could not delete quarantined voice clip " + path, exception);
+                }
+            }
+        } catch (IOException exception) {
+            logger.log(Level.WARNING, "Could not scan quarantined voice clips in " + directory, exception);
+        }
+        deleteDirectoryIfEmpty(directory);
+        return deleted;
+    }
+
+    private int deleteQuarantinedDirectoryForClear(Path directory, DeletionFailures failures) {
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) {
+            return 0;
+        }
+        int deleted = 0;
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path path : files
+                    .filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                    .filter(file -> file.getFileName().toString().endsWith(".wav")).toList()) {
+                if (closed) {
+                    failures.add(new IOException("voice clip storage closed during clear"));
+                    break;
+                }
+                try {
+                    if (Files.deleteIfExists(path)) {
+                        deleted++;
+                    }
+                } catch (IOException exception) {
+                    failures.add(exception);
+                    logger.log(Level.WARNING,
+                            "Could not delete quarantined voice clip " + path, exception);
+                }
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+        }
+        deleteDirectoryIfEmptyForClear(directory, failures);
+        return deleted;
+    }
+
+    private void deleteDirectoryIfEmpty(Path directory) {
+        if (closed) {
+            return;
+        }
+        try (Stream<Path> contents = Files.list(directory)) {
+            if (contents.findAny().isEmpty()) {
+                Files.deleteIfExists(directory);
+            }
+        } catch (IOException ignored) {
+            // A failed cleanup does not affect the clip index.
+        }
+    }
+
+    private void deleteDirectoryIfEmptyForClear(Path directory, DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        try (Stream<Path> contents = Files.list(directory)) {
+            if (contents.findAny().isEmpty()) {
+                Files.deleteIfExists(directory);
+            } else {
+                failures.add(new IOException("voice clip clear left data in " + directory));
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not remove empty voice clip directory " + directory,
+                    exception);
+        }
+    }
+
+    private void removeEmptyDirectories() {
+        if (closed || !Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> directories = Files.list(root)) {
+            directories.filter(Files::isDirectory).forEach(directory -> {
+                if (closed) {
+                    return;
+                }
+                try (Stream<Path> contents = Files.list(directory)) {
+                    if (contents.findAny().isEmpty()) {
+                        Files.deleteIfExists(directory);
+                    }
+                } catch (IOException ignored) {
+                    // A failed cleanup does not affect the clip index.
+                }
+            });
+        } catch (IOException ignored) {
+            // A failed cleanup does not affect the clip index.
+        }
+    }
+
+    private void removeEmptyDirectoriesForClear(DeletionFailures failures) {
+        if (closed) {
+            failures.add(new IOException("voice clip storage closed during clear"));
+            return;
+        }
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> directories = Files.list(root)) {
+            for (Path directory : directories
+                    .filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
+                // The clip paths and targeted quarantine directory already
+                // report deletion failures. Other player directories may
+                // legitimately remain populated during clearPlayer().
+                deleteDirectoryIfEmpty(directory);
+            }
+        } catch (IOException exception) {
+            failures.add(exception);
+            logger.log(Level.WARNING, "Could not scan voice clip directories during clear", exception);
+        }
+    }
+
+    private static String safePlayerName(String playerName) {
+        String safe = playerName == null ? "unknown" : playerName.replaceAll("[^A-Za-z0-9_]", "_");
+        return safe.isBlank() ? "unknown" : safe.substring(0, Math.min(32, safe.length()));
+    }
+
+    private static final class DeletionFailures {
+        private IOException failure;
+
+        private void add(IOException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        }
+
+        private boolean hasFailure() {
+            return failure != null;
+        }
+
+        private void throwIfPresent() {
+            if (failure != null) {
+                throw new UncheckedIOException(failure);
+            }
+        }
+    }
+
+    private final class PendingSave implements Runnable {
+        private final UUID playerId;
+        private final String playerName;
+        private final short[] samples;
+        private final long bytes;
+        private final AtomicBoolean completed = new AtomicBoolean();
+
+        private PendingSave(UUID playerId, String playerName, short[] samples, long bytes) {
+            this.playerId = playerId;
+            this.playerName = playerName;
+            this.samples = samples;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void run() {
+            try {
+                beforeSave.run();
+                if (!closed && saveNow(playerId, playerName, samples)) {
+                    successfulSaveCount.incrementAndGet();
+                }
+            } catch (IOException | RuntimeException exception) {
+                failedSaveCount.incrementAndGet();
+                logger.log(Level.WARNING, "Could not save speech clip for "
+                        + safePlayerName(playerName), exception);
+            } finally {
+                complete();
+            }
+        }
+
+        private void cancel() {
+            complete();
+        }
+
+        private void complete() {
+            if (completed.compareAndSet(false, true)) {
+                pendingSaves.remove(this);
+                bulkIoAdmissions.release();
+                releaseReservation(bytes);
+            }
+        }
+    }
+
+    private final class PendingRead implements Runnable {
+        private final VoiceClip clip;
+        private final CompletableFuture<short[]> result;
+        private final AtomicBoolean completed = new AtomicBoolean();
+
+        private PendingRead(VoiceClip clip, CompletableFuture<short[]> result) {
+            this.clip = clip;
+            this.result = result;
+        }
+
+        @Override
+        public void run() {
+            try {
+                short[] samples = closed ? null : readNow(clip);
+                result.complete(closed ? null : samples);
+            } finally {
+                complete();
+            }
+        }
+
+        private void cancel() {
+            result.complete(null);
+            complete();
+        }
+
+        private void complete() {
+            if (completed.compareAndSet(false, true)) {
+                pendingReads.remove(this);
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        shutdown();
+    }
+
+    /**
+     * Closes storage and returns whether every storage worker reached a terminal state.
+     * A non-terminal result is fail-closed: running tasks cannot register clips or
+     * invalidate the active index after the close boundary.
+     */
+    public boolean shutdown() {
+        synchronized (mutationLock) {
+            closed = true;
+        }
+        maintenanceThread.interrupt();
+        readExecutor.shutdown();
+        ioExecutor.shutdown();
+        boolean readStopped = true;
+        boolean ioStopped = true;
+        try {
+            maintenanceThread.join(shutdownTimeoutMilliseconds);
+            readStopped = awaitExecutor(readExecutor, "Voice clip reads", pendingReads,
+                    shutdownTimeoutMilliseconds, shutdownFollowupMilliseconds);
+            ioStopped = awaitExecutor(ioExecutor, "Voice clip storage", pendingSaves,
+                    shutdownTimeoutMilliseconds, shutdownFollowupMilliseconds);
+        } catch (InterruptedException exception) {
+            readExecutor.shutdownNow();
+            ioExecutor.shutdownNow();
+            pendingReads.forEach(PendingRead::cancel);
+            pendingSaves.forEach(PendingSave::cancel);
+            readStopped = false;
+            ioStopped = false;
+            Thread.currentThread().interrupt();
+        }
+        workersStopped = !maintenanceThread.isAlive() && readStopped && ioStopped
+                && readExecutor.isTerminated() && ioExecutor.isTerminated();
+        if (!workersStopped) {
+            logger.severe("Voice clip storage shutdown did not reach a terminal worker state; "
+                    + "post-close clip registration and index mutation are disabled.");
+        }
+        return workersStopped;
+    }
+
+    boolean storageWorkersStopped() {
+        return workersStopped || (!maintenanceThread.isAlive()
+                && readExecutor.isTerminated() && ioExecutor.isTerminated());
+    }
+
+    private boolean awaitExecutor(ThreadPoolExecutor executor, String description,
+                                      Set<?> pending, long timeoutMilliseconds,
+                                      long followupMilliseconds) throws InterruptedException {
+        if (executor.awaitTermination(timeoutMilliseconds, TimeUnit.MILLISECONDS)) {
+            return true;
+        }
+        logger.warning(description + " did not finish before shutdown; cancelling queued work.");
+        executor.shutdownNow();
+        if (pending != null) {
+            pending.forEach(item -> {
+                if (item instanceof PendingRead read) {
+                    read.cancel();
+                } else if (item instanceof PendingSave save) {
+                    save.cancel();
+                }
+            });
+        }
+        return executor.awaitTermination(followupMilliseconds, TimeUnit.MILLISECONDS);
+    }
+
+    @FunctionalInterface
+    interface WavReader {
+        WavIO.WavData read(Path path) throws IOException;
+    }
+}
